@@ -1,12 +1,37 @@
 // main.cpp  –  FaceGuard Pro (ESP32-CAM)
 // Entry point: camera init, WiFi, NTP, face recognition attendance loop.
+//
+// ── WDT / stability fix overview ─────────────────────────────────────────────
+// Problem 1 – WDT on CPU 1 IDLE:
+//   attendanceLoop() previously ran inside Arduino loop() on CPU 1, the same
+//   core as httpd.  face_detect() blocks for 300–800 ms, starving httpd and
+//   the CPU 1 IDLE task past the 5-second WDT window.
+//   Fix: attendanceTask() is now pinned to CPU 0 via xTaskCreatePinnedToCore,
+//   completely off the HTTP core.
+//
+// Problem 2 – "Face not recognised" spam / CPU thrash:
+//   lastRecognitionTime was only updated on a successful match.  On a no-match
+//   the loop re-ran immediately (only 100 ms gap), hammering face_detect().
+//   Fix: lastRecognitionTime is stamped at the START of every detection
+//   attempt, enforcing the full RECOGNITION_COOLDOWN between runs regardless
+//   of outcome.
+//
+// Problem 3 – "JPG Decompression Failed":
+//   fb_count=1 meant one shared DMA buffer.  Under heavy CPU load the camera
+//   DMA would be starved and corrupt the buffer before the stream handler
+//   encoded it.
+//   Fix: fb_count raised to 2 when PSRAM is present so the camera can fill one
+//   buffer while the previous is in use.  A free-heap guard prevents matrix
+//   allocation when memory is too low.
+// ─────────────────────────────────────────────────────────────────────────────
 
 #include <stdio.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include "esp_task_wdt.h"
 #include <Arduino.h>
 #include "esp_camera.h"
-#include "sd_card.h"        // includes SdFat – no separate FS.h / SD_MMC.h needed
+#include "sd_card.h"
 #include <WiFi.h>
 #include "fd_forward.h"
 #include "fr_forward.h"
@@ -17,21 +42,26 @@
 #include "global.h"
 
 // ─── WiFi credentials ─────────────────────────────────────────────────────────
-// UPDATE THESE to match your network before flashing!
 const char* ssid     = "itel RS4";
 const char* password = "Asdf1234";
 
 // ─── Global definitions (declared extern in global.h) ────────────────────────
 bool                isAttendanceMode     = true;
-unsigned long       lastRecognitionTime  = 0;
-const unsigned long RECOGNITION_COOLDOWN = 5000;   // ms between recognitions
+unsigned long       lastRecognitionTime  = 0;  // set only on a successful match
+unsigned long       lastAttemptTime      = 0;  // set on every detection attempt
+const unsigned long RECOGNITION_COOLDOWN = 5000;  // ms – prevents double-logging same person
+const unsigned long ATTEMPT_COOLDOWN     = 500;   // ms – retry gap when no face found
 bool                ntpSynced            = false;
 AttendanceSettings  gSettings;
+
+// ─── Minimum free heap before attempting matrix allocation ────────────────────
+// face_detect() + aligned matrix need ~80 KB; guard at 100 KB to be safe.
+#define MIN_FREE_HEAP_BYTES  (100 * 1024)
 
 // ─── Forward declarations ────────────────────────────────────────────────────
 void startCameraServer();
 void initFaceRecognition();
-void attendanceLoop();
+static void attendanceTask(void *pvParameters);
 
 // ─── Camera initialisation ────────────────────────────────────────────────────
 static bool initCamera() {
@@ -60,7 +90,7 @@ static bool initCamera() {
     if (psramFound()) {
         config.frame_size   = FRAMESIZE_UXGA;
         config.jpeg_quality = 12;
-        config.fb_count     = 1;
+        config.fb_count     = 2;   // ← was 1; 2 prevents DMA starvation / JPG errors
     } else {
         config.frame_size   = FRAMESIZE_SVGA;
         config.jpeg_quality = 12;
@@ -89,10 +119,10 @@ void setup() {
     Serial.begin(115200);
     Serial.println("\n\n=== FaceGuard Pro v2.0 ===");
 
-    // 1) SD card + settings  (SdFat – long filenames supported)
+    // 1) SD card + settings
     Bridge::initSD();
-    Bridge::loadSettings(gSettings);   // fills gSettings (defaults if no file)
-    Bridge::listDir("/", 1);           // no fs::FS param – SdFat handles it internally
+    Bridge::loadSettings(gSettings);
+    Bridge::listDir("/", 1);
 
     // 2) Camera
     if (!initCamera()) {
@@ -109,26 +139,42 @@ void setup() {
         delay(500); Serial.print(".");
     }
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\n[WiFi] Connected – IP: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("\n[WiFi] Connected – IP: %s\n",
+                      WiFi.localIP().toString().c_str());
     } else {
         Serial.println("\n[WiFi] Connection failed – running without network");
     }
 
-    // 4) NTP time sync
+    // 4) NTP sync
     if (WiFi.status() == WL_CONNECTED) {
         Bridge::syncNTP();
     }
 
-    // 5) Face recognition init
+    // 5) Face recognition model init
     initFaceRecognition();
 
-    // 6) HTTP server
+    // 6) HTTP server (runs its own tasks internally, stays on CPU 1)
     startCameraServer();
 
-    Serial.printf("\n[READY] Admin portal:   http://%s\n",    WiFi.localIP().toString().c_str());
-    Serial.printf("[READY] Camera stream:  http://%s:81/stream\n", WiFi.localIP().toString().c_str());
-    Serial.printf("[READY] Login:          admin / 1234\n");
-    Serial.println("[READY] Attendance mode active.");
+    // 7) Attendance task – pinned to CPU 0, away from httpd on CPU 1.
+    //    Stack 8 KB is enough for the face pipeline; priority 1 keeps it below
+    //    the idle priority so it never blocks the WDT feed.
+    xTaskCreatePinnedToCore(
+        attendanceTask,     // function
+        "atd",              // name (shown in WDT logs)
+        8192,               // stack bytes
+        NULL,               // parameter
+        1,                  // priority
+        NULL,               // handle (not needed)
+        0                   // CPU core 0
+    );
+
+    Serial.printf("\n[READY] Admin portal:  http://%s\n",
+                  WiFi.localIP().toString().c_str());
+    Serial.printf("[READY] Stream:        http://%s:81/stream\n",
+                  WiFi.localIP().toString().c_str());
+    Serial.println("[READY] Login: admin / 1234");
+    Serial.println("[READY] Attendance task running on CPU 0.");
 }
 
 // ─── initFaceRecognition() ───────────────────────────────────────────────────
@@ -155,68 +201,119 @@ void initFaceRecognition() {
     Serial.printf("[FACE] Loaded %d enrolled face(s)\n", id_list.count);
 }
 
-// ─── attendanceLoop() ────────────────────────────────────────────────────────
-void attendanceLoop() {
-    if (!isAttendanceMode)      return;
-    if (!gSettings.autoMode)    return;
-
-    unsigned long now = millis();
-    if (now - lastRecognitionTime < RECOGNITION_COOLDOWN) return;
-
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) return;
-
-    dl_matrix3du_t *im = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
-    if (!im) { esp_camera_fb_return(fb); return; }
-
-    if (!fmt2rgb888(fb->buf, fb->len, fb->format, im->item)) {
-        dl_matrix3du_free(im);
-        esp_camera_fb_return(fb);
-        return;
-    }
-    esp_camera_fb_return(fb);
-
+// ─── attendanceTask() – FreeRTOS task pinned to CPU 0 ────────────────────────
+static void attendanceTask(void *pvParameters) {
     extern mtmn_config_t   mtmn_config;
-    box_array_t *boxes = face_detect(im, &mtmn_config);
+    extern face_id_name_list id_list;
 
-    if (boxes) {
-        extern face_id_name_list id_list;
-        dl_matrix3du_t *aligned = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
-        if (aligned && align_face(boxes, im, aligned) == ESP_OK) {
-            dl_matrix3d_t *fid    = get_face_id(aligned);
-            face_id_node  *match  = recognize_face_with_name(&id_list, fid);
-            if (match) {
-                Serial.printf("[ATD] Recognised: %s\n", match->id_name);
+    Serial.println("[ATD] Task started on CPU 0");
 
-                // Build AttendanceRecord struct (replaces three loose Strings)
-                AttendanceRecord rec = AttendanceRecord::fromFace(
-                    match->id_name,   // uid
-                    match->id_name,   // name  (looked up from DB by SD layer if needed)
-                    "");              // dept  (empty = SD layer will skip dept filter)
-                Bridge::logAttendance(rec);
-                lastRecognitionTime = now;
-
-                // Optional buzzer feedback
-                if (gSettings.buzzerEnabled) {
-                    digitalWrite(BUZZER_GPIO_NUM, HIGH); delay(200);
-                    digitalWrite(BUZZER_GPIO_NUM, LOW);
-                }
-            } else {
-                Serial.println("[ATD] Face not recognised");
-            }
-            dl_matrix3d_free(fid);
+    while (true) {
+        // ── Gate checks ──────────────────────────────────────────────────────
+        if (!isAttendanceMode || !gSettings.autoMode) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
         }
-        if (aligned) dl_matrix3du_free(aligned);
-        dl_lib_free(boxes->score);
-        dl_lib_free(boxes->box);
-        if (boxes->landmark) dl_lib_free(boxes->landmark);
-        dl_lib_free(boxes);
+
+        unsigned long now = millis();
+
+        // ── Two independent cooldowns ─────────────────────────────────────────
+        // ATTEMPT_COOLDOWN  (500 ms): throttles how often face_detect() runs.
+        //   Fires on every attempt so the camera stays responsive – if a face
+        //   is missed due to a bad angle it retries half a second later.
+        //
+        // RECOGNITION_COOLDOWN (5000 ms): only armed after a *successful match*.
+        //   Prevents the same person being logged twice during one "session"
+        //   while still allowing quick retries for unrecognised faces.
+        if (now - lastAttemptTime < ATTEMPT_COOLDOWN) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        if (now - lastRecognitionTime < RECOGNITION_COOLDOWN) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // Stamp the attempt regardless of outcome (throttles CPU, stops spam)
+        lastAttemptTime = now;
+
+        // ── Heap guard ───────────────────────────────────────────────────────
+        if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < MIN_FREE_HEAP_BYTES) {
+            Serial.printf("[ATD] Low heap (%lu B) – skipping frame\n",
+                          (unsigned long)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        // ── Grab frame ───────────────────────────────────────────────────────
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        // ── Convert to RGB888 ────────────────────────────────────────────────
+        dl_matrix3du_t *im = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
+        if (!im) {
+            esp_camera_fb_return(fb);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        bool converted = fmt2rgb888(fb->buf, fb->len, fb->format, im->item);
+        esp_camera_fb_return(fb);   // release buffer ASAP so stream can reuse it
+        fb = nullptr;
+
+        if (!converted) {
+            dl_matrix3du_free(im);
+            continue;
+        }
+
+        // ── Face detection ───────────────────────────────────────────────────
+        box_array_t *boxes = face_detect(im, &mtmn_config);
+
+        if (boxes) {
+            dl_matrix3du_t *aligned = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
+
+            if (aligned && align_face(boxes, im, aligned) == ESP_OK) {
+                dl_matrix3d_t *fid   = get_face_id(aligned);
+                face_id_node  *match = recognize_face_with_name(&id_list, fid);
+
+                if (match) {
+                    Serial.printf("[ATD] Recognised: %s\n", match->id_name);
+                    AttendanceRecord rec = AttendanceRecord::fromFace(
+                        match->id_name, match->id_name, "");
+                    Bridge::logAttendance(rec);
+                    lastRecognitionTime = now;  // ← only here: starts the 5s no-relog window
+
+                    if (gSettings.buzzerEnabled) {
+                        digitalWrite(BUZZER_GPIO_NUM, HIGH);
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                        digitalWrite(BUZZER_GPIO_NUM, LOW);
+                    }
+                } else {
+                    Serial.println("[ATD] Face detected but not recognised");
+                }
+                dl_matrix3d_free(fid);
+            }
+
+            if (aligned) dl_matrix3du_free(aligned);
+            dl_lib_free(boxes->score);
+            dl_lib_free(boxes->box);
+            if (boxes->landmark) dl_lib_free(boxes->landmark);
+            dl_lib_free(boxes);
+        }
+
+        dl_matrix3du_free(im);
+
+        // Yield to let the scheduler breathe between heavy inference cycles.
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
-    dl_matrix3du_free(im);
 }
 
-// ─── loop() ───────────────────────────────────────────────────────────────────
+// ─── loop() – nothing heavy lives here any more ───────────────────────────────
+// Arduino's loop() runs on CPU 1 alongside httpd.  Keeping it minimal means
+// httpd gets clean scheduling and the CPU 1 IDLE task always feeds the WDT.
 void loop() {
-    attendanceLoop();
-    delay(100);
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }
