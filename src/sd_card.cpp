@@ -49,7 +49,7 @@ String getCurrentDateStr() {
     if (ntpSynced) {
         struct tm ti;
         if (getLocalTime(&ti)) {
-            char buf[12];
+            char buf[36]; // Increased buffer size to avoid truncation
             snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
                      ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday);
             return String(buf);
@@ -72,7 +72,7 @@ String getCurrentTimeStr() {
         }
     }
     unsigned long s = millis() / 1000;
-    char buf[10];
+    char buf[20];
     snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
              (s/3600)%24, (s/60)%60, s%60);
     return String(buf);
@@ -103,7 +103,7 @@ static String dateStrDaysAgo(int daysAgo) {
     time_t now  = time(nullptr);
     time_t then = now - (time_t)daysAgo * 86400;
     struct tm *ti = localtime(&then);
-    char buf[12];
+    char buf[36];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
              ti->tm_year+1900, ti->tm_mon+1, ti->tm_mday);
     return String(buf);
@@ -588,7 +588,7 @@ String getStatsJSON() {
     String storageStr = "--";
     if (_sdOk) {
         uint64_t used = SD_MMC.usedBytes() / 1024;
-        storageStr = String(used) + " KB";
+        storageStr = String((double)used) + " KB";
     }
 
     // Uptime
@@ -615,10 +615,10 @@ String getStatsJSON() {
 String getStorageJSON() {
     DynamicJsonDocument doc(256);
     if (_sdOk) {
-        doc["total"] = String(SD_MMC.totalBytes() / (1024*1024)) + " MB";
-        doc["used"]  = String(SD_MMC.usedBytes()  / (1024*1024)) + " MB";
-        doc["free"]  = String((SD_MMC.totalBytes()-SD_MMC.usedBytes()) / (1024*1024)) + " MB";
-        doc["pct"]   = (int)((float)SD_MMC.usedBytes()/SD_MMC.totalBytes()*100);
+        doc["total"] = String((double)SD_MMC.totalBytes() / (1024*1024)) + " MB";
+        doc["used"]  = String((double)SD_MMC.usedBytes()  / (1024*1024)) + " MB";
+        doc["free"]  = String((double)(SD_MMC.totalBytes()-SD_MMC.usedBytes()) / (1024*1024)) + " MB";
+        doc["pct"]   = (int)((double)SD_MMC.usedBytes()/SD_MMC.totalBytes()*100);
     } else {
         doc["total"] = "--"; doc["used"] = "--"; doc["free"] = "--"; doc["pct"] = 0;
     }
