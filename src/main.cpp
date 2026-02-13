@@ -6,7 +6,7 @@
 #include <freertos/task.h>
 #include <Arduino.h>
 #include "esp_camera.h"
-#include "sd_card.h"
+#include "sd_card.h"        // includes SdFat – no separate FS.h / SD_MMC.h needed
 #include <WiFi.h>
 #include "fd_forward.h"
 #include "fr_forward.h"
@@ -14,22 +14,19 @@
 
 #define CAMERA_MODEL_AI_THINKER
 #include "camera_pins.h"
-#include "FS.h"
-#include "SD_MMC.h"
 #include "global.h"
 
 // ─── WiFi credentials ─────────────────────────────────────────────────────────
 // UPDATE THESE to match your network before flashing!
-const char* ssid = "itel RS4";
+const char* ssid     = "itel RS4";
 const char* password = "Asdf1234";
 
-
 // ─── Global definitions (declared extern in global.h) ────────────────────────
-bool                 isAttendanceMode    = true;
-unsigned long        lastRecognitionTime = 0;
-const unsigned long  RECOGNITION_COOLDOWN = 5000; // ms between recognitions
-bool                 ntpSynced          = false;
-AttendanceSettings   gSettings;
+bool                isAttendanceMode     = true;
+unsigned long       lastRecognitionTime  = 0;
+const unsigned long RECOGNITION_COOLDOWN = 5000;   // ms between recognitions
+bool                ntpSynced            = false;
+AttendanceSettings  gSettings;
 
 // ─── Forward declarations ────────────────────────────────────────────────────
 void startCameraServer();
@@ -82,7 +79,7 @@ static bool initCamera() {
         s->set_brightness(s, 1);
         s->set_saturation(s, -2);
     }
-    s->set_framesize(s, FRAMESIZE_QVGA); // Required for face recognition
+    s->set_framesize(s, FRAMESIZE_QVGA);  // required for face recognition
     Serial.println("[CAM] Initialised OK");
     return true;
 }
@@ -92,10 +89,10 @@ void setup() {
     Serial.begin(115200);
     Serial.println("\n\n=== FaceGuard Pro v2.0 ===");
 
-    // 1) SD card + settings
+    // 1) SD card + settings  (SdFat – long filenames supported)
     Bridge::initSD();
     Bridge::loadSettings(gSettings);   // fills gSettings (defaults if no file)
-    Bridge::listDir(SD_MMC, "/", 1);
+    Bridge::listDir("/", 1);           // no fs::FS param – SdFat handles it internally
 
     // 2) Camera
     if (!initCamera()) {
@@ -104,7 +101,7 @@ void setup() {
     }
 
     // 3) WiFi
-    strncpy(gSettings.ssid, ssid, sizeof(gSettings.ssid)-1);
+    strncpy(gSettings.ssid, ssid, sizeof(gSettings.ssid) - 1);
     WiFi.begin(ssid, password);
     Serial.print("[WiFi] Connecting");
     int tries = 0;
@@ -117,7 +114,7 @@ void setup() {
         Serial.println("\n[WiFi] Connection failed – running without network");
     }
 
-    // 4) NTP time sync (requires WiFi)
+    // 4) NTP time sync
     if (WiFi.status() == WL_CONNECTED) {
         Bridge::syncNTP();
     }
@@ -128,16 +125,15 @@ void setup() {
     // 6) HTTP server
     startCameraServer();
 
-    Serial.printf("\n[READY] Admin portal: http://%s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("[READY] Camera stream: http://%s:81/stream\n", WiFi.localIP().toString().c_str());
-    Serial.printf("[READY] Login: %s / %s\n", "admin", "1234");
+    Serial.printf("\n[READY] Admin portal:   http://%s\n",    WiFi.localIP().toString().c_str());
+    Serial.printf("[READY] Camera stream:  http://%s:81/stream\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[READY] Login:          admin / 1234\n");
     Serial.println("[READY] Attendance mode active.");
 }
 
-// ─── initFaceRecognition() – called from setup & can be recalled later ────────
+// ─── initFaceRecognition() ───────────────────────────────────────────────────
 void initFaceRecognition() {
-    // extern objects defined in app_httpd.cpp
-    extern mtmn_config_t mtmn_config;
+    extern mtmn_config_t   mtmn_config;
     extern face_id_name_list id_list;
 
     mtmn_config.type                         = FAST;
@@ -156,13 +152,13 @@ void initFaceRecognition() {
 
     face_id_name_init(&id_list, 7, 5);
     Bridge::read_face_id_name_list_sdcard(&id_list, "/FACE.BIN");
-    Serial.printf("[FACE] Loaded %d enrolled faces\n", id_list.count);
+    Serial.printf("[FACE] Loaded %d enrolled face(s)\n", id_list.count);
 }
 
-// ─── attendanceLoop() – runs in loop(), skipped when admin is active ──────────
+// ─── attendanceLoop() ────────────────────────────────────────────────────────
 void attendanceLoop() {
-    if (!isAttendanceMode) return;
-    if (!gSettings.autoMode) return;
+    if (!isAttendanceMode)      return;
+    if (!gSettings.autoMode)    return;
 
     unsigned long now = millis();
     if (now - lastRecognitionTime < RECOGNITION_COOLDOWN) return;
@@ -174,23 +170,30 @@ void attendanceLoop() {
     if (!im) { esp_camera_fb_return(fb); return; }
 
     if (!fmt2rgb888(fb->buf, fb->len, fb->format, im->item)) {
-        dl_matrix3du_free(im); esp_camera_fb_return(fb); return;
+        dl_matrix3du_free(im);
+        esp_camera_fb_return(fb);
+        return;
     }
     esp_camera_fb_return(fb);
 
-    extern mtmn_config_t mtmn_config;
+    extern mtmn_config_t   mtmn_config;
     box_array_t *boxes = face_detect(im, &mtmn_config);
 
     if (boxes) {
         extern face_id_name_list id_list;
         dl_matrix3du_t *aligned = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
         if (aligned && align_face(boxes, im, aligned) == ESP_OK) {
-            dl_matrix3d_t *fid = get_face_id(aligned);
-            face_id_node  *match = recognize_face_with_name(&id_list, fid);
+            dl_matrix3d_t *fid    = get_face_id(aligned);
+            face_id_node  *match  = recognize_face_with_name(&id_list, fid);
             if (match) {
                 Serial.printf("[ATD] Recognised: %s\n", match->id_name);
-                Bridge::logAttendance(String(match->id_name),
-                                      String(match->id_name), "");
+
+                // Build AttendanceRecord struct (replaces three loose Strings)
+                AttendanceRecord rec = AttendanceRecord::fromFace(
+                    match->id_name,   // uid
+                    match->id_name,   // name  (looked up from DB by SD layer if needed)
+                    "");              // dept  (empty = SD layer will skip dept filter)
+                Bridge::logAttendance(rec);
                 lastRecognitionTime = now;
 
                 // Optional buzzer feedback
@@ -204,7 +207,8 @@ void attendanceLoop() {
             dl_matrix3d_free(fid);
         }
         if (aligned) dl_matrix3du_free(aligned);
-        dl_lib_free(boxes->score); dl_lib_free(boxes->box);
+        dl_lib_free(boxes->score);
+        dl_lib_free(boxes->box);
         if (boxes->landmark) dl_lib_free(boxes->landmark);
         dl_lib_free(boxes);
     }

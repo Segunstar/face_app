@@ -1,13 +1,17 @@
 // sd_card.cpp  –  FaceGuard Pro  (ESP32-CAM)
-// All SD / persistence / time functions for the attendance system.
+// All SD / persistence / time functions.
+// Uses greiman/SdFat v2 for full long-filename (LFN) support on FAT32/exFAT.
 
 #include "fr_forward.h"
 
 #undef min
 #undef max
 #include "Arduino.h"
-#include "FS.h"
-#include "SD_MMC.h"
+
+// ── SdFat replaces Arduino SD_MMC + FS ───────────────────────────────────────
+#include <SdFat.h>          // greiman/SdFat v2
+#include <sdios.h>
+
 #include "SPI.h"
 #include <ArduinoJson.h>
 #include <time.h>
@@ -21,6 +25,36 @@
 static bool    _sdOk      = false;
 static time_t  _bootEpoch = 0;   // epoch at first NTP sync (for uptime calc)
 
+// SdFs supports FAT16 / FAT32 / exFAT and enables LFN automatically.
+// FIFO_SDIO uses the ESP32 hardware SDMMC peripheral (same pins as SD_MMC).
+static SdFs sd;
+
+// ─── Internal line-reader helper ─────────────────────────────────────────────
+// Reads one '\n'-terminated line from an open FsFile into a String.
+static String sdReadLine(FsFile &f) {
+    String line;
+    line.reserve(128);
+    int c;
+    while ((c = f.read()) >= 0) {
+        if (c == '\n') break;
+        if (c != '\r') line += (char)c;  // skip Windows CR
+    }
+    return line;
+}
+
+// ─── Internal whole-file reader ──────────────────────────────────────────────
+static String sdReadAll(FsFile &f) {
+    uint32_t sz = (uint32_t)f.fileSize();
+    if (sz == 0) return "";
+    char *buf = (char*)malloc(sz + 1);
+    if (!buf) return "";
+    f.read(buf, sz);
+    buf[sz] = '\0';
+    String s = String(buf);
+    free(buf);
+    return s;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  NTP / time helpers
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -28,7 +62,6 @@ namespace Bridge {
 
 void syncNTP() {
     configTime(gSettings.gmtOffsetSec, 0, gSettings.ntpServer);
-    // Wait up to 5 s for sync
     struct tm ti;
     int retries = 0;
     while (!getLocalTime(&ti) && retries++ < 10) delay(500);
@@ -49,13 +82,13 @@ String getCurrentDateStr() {
     if (ntpSynced) {
         struct tm ti;
         if (getLocalTime(&ti)) {
-            char buf[36]; // Increased buffer size to avoid truncation
+            char buf[12];
             snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
                      ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday);
             return String(buf);
         }
     }
-    // Fallback: days since boot (not calendar date, but unique per day)
+    // Fallback: unique day index since boot
     unsigned long days = millis() / (24UL * 60 * 60 * 1000);
     return "day_" + String(days);
 }
@@ -80,14 +113,13 @@ String getCurrentTimeStr() {
 
 // Returns "HH:MM"
 String getCurrentHHMM() {
-    String t = getCurrentTimeStr();
-    return t.substring(0, 5);
+    return getCurrentTimeStr().substring(0, 5);
 }
 
 // Returns label like "Mon", "Tue" … for a date N days ago
 static String dayLabel(int daysAgo) {
     if (!ntpSynced) return "D-" + String(daysAgo);
-    time_t now = time(nullptr);
+    time_t now  = time(nullptr);
     time_t then = now - (time_t)daysAgo * 86400;
     struct tm *ti = localtime(&then);
     const char *days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
@@ -103,88 +135,103 @@ static String dateStrDaysAgo(int daysAgo) {
     time_t now  = time(nullptr);
     time_t then = now - (time_t)daysAgo * 86400;
     struct tm *ti = localtime(&then);
-    char buf[36];
+    char buf[12];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
              ti->tm_year+1900, ti->tm_mon+1, ti->tm_mday);
     return String(buf);
 }
 
 // Attendance status based on current time and settings
-static String computeStatus(String hhmm) {
-    if (hhmm == "" || hhmm == "--") return "Absent";
-    // Compare "HH:MM" strings lexicographically (works because zero-padded)
-    if (hhmm >= String(gSettings.absentTime)) return "Absent";
-    if (hhmm >= String(gSettings.lateTime))   return "Late";
+static String computeStatus(const char *hhmm) {
+    if (!hhmm || hhmm[0] == '\0' || strcmp(hhmm, "--") == 0) return "Absent";
+    if (strcmp(hhmm, gSettings.absentTime) >= 0) return "Absent";
+    if (strcmp(hhmm, gSettings.lateTime)   >= 0) return "Late";
     return "Present";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  SD Initialisation
 // ═══════════════════════════════════════════════════════════════════════════════
-
-
 void initSD() {
-    if (!SD_MMC.begin()) {
-        Serial.println("[SD] Mount failed");
+    // SdioConfig(FIFO_SDIO) uses ESP32 hardware SDMMC peripheral.
+    // Use DMA_SDIO for slightly better throughput if FIFO gives issues.
+    if (!sd.begin(SdioConfig(FIFO_SDIO))) {
+        Serial.println("[SD] Mount failed – check card and connections");
         _sdOk = false;
         return;
     }
-    _sdOk = (SD_MMC.cardType() != CARD_NONE);
-    if (!_sdOk) { Serial.println("[SD] No card"); return; }
+    _sdOk = true;
 
-    // Create required directories
+    // Create required directories (sd.mkdir does nothing if already present)
     const char *dirs[] = { "/db", "/atd", "/cfg", nullptr };
     for (int i = 0; dirs[i]; i++) {
-        if (!SD_MMC.exists(dirs[i])) {
-            SD_MMC.mkdir(dirs[i]);
+        if (!sd.exists(dirs[i])) {
+            sd.mkdir(dirs[i]);
             Serial.printf("[SD] Created %s\n", dirs[i]);
         }
     }
+
     // Bootstrap empty user DB
-    if (!SD_MMC.exists("/db/users.txt")) {
-        File f = SD_MMC.open("/db/users.txt", FILE_WRITE);
-        if (f) { f.print("[]"); f.close(); }
+    if (!sd.exists("/db/users.txt")) {
+        FsFile f;
+        if (f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) {
+            f.print("[]");
+            f.close();
+        }
     }
-    Serial.println("[SD] Ready");
+    Serial.println("[SD] Ready  (LFN enabled via SdFat)");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Directory listing
 // ═══════════════════════════════════════════════════════════════════════════════
-void listDir(fs::FS &fs, const char *dirname, uint8_t levels) {
-    File root = fs.open(dirname);
-    if (!root || !root.isDirectory()) return;
-    File file = root.openNextFile();
-    while (file) {
-        if (file.isDirectory()) {
-            Serial.printf("  DIR : %s\n", file.name());
-            if (levels) listDir(fs, file.path(), levels - 1);
+void listDir(const char *dirname, uint8_t levels) {
+    FsFile dir, entry;
+    if (!dir.open(dirname, O_RDONLY)) return;
+
+    while (entry.openNext(&dir, O_RDONLY)) {
+        char fname[256] = {0};
+        entry.getName(fname, sizeof(fname));
+
+        if (entry.isDirectory()) {
+            Serial.printf("  DIR : %s\n", fname);
+            if (levels > 0) {
+                char childPath[512];
+                snprintf(childPath, sizeof(childPath), "%s/%s", dirname, fname);
+                listDir(childPath, levels - 1);
+            }
         } else {
-            Serial.printf("  FILE: %-30s  %d bytes\n", file.name(), file.size());
+            Serial.printf("  FILE: %-40s  %lu bytes\n",
+                          fname, (unsigned long)entry.fileSize());
         }
-        file = root.openNextFile();
+        entry.close();
     }
+    dir.close();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Face-ID binary persistence (unchanged logic, improved error handling)
+//  Face-ID binary persistence
 // ═══════════════════════════════════════════════════════════════════════════════
 void write_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
     if (!_sdOk) return;
-    File f = SD_MMC.open(path, FILE_WRITE);
-    if (!f) { Serial.println("[SD] write FACE.BIN failed"); return; }
+    FsFile f;
+    if (!f.open(path, O_WRONLY | O_CREAT | O_TRUNC)) {
+        Serial.println("[SD] write FACE.BIN failed");
+        return;
+    }
 
     f.write((uint8_t)l->count);
     if (l->count > 0 && l->head) {
         f.write((uint8_t)l->confirm_times);
-        face_id_node *p = l->head;
-        uint8_t saved = 0;
-        const int vsz = FACE_ID_SIZE * sizeof(float);
+        face_id_node *p  = l->head;
+        uint8_t       saved = 0;
+        const int     vsz   = FACE_ID_SIZE * sizeof(float);
         while (p && saved < l->count) {
-            f.write((uint8_t*)p->id_name, ENROLL_NAME_LEN);
+            f.write((const uint8_t*)p->id_name, ENROLL_NAME_LEN);
             if (p->id_vec && p->id_vec->item)
-                f.write((uint8_t*)p->id_vec->item, vsz);
-            saved++; p = p->next;
+                f.write((const uint8_t*)p->id_vec->item, vsz);
+            saved++;
+            p = p->next;
         }
         Serial.printf("[SD] Saved %d face(s)\n", saved);
     }
@@ -192,17 +239,19 @@ void write_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
 }
 
 void read_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
-    if (!_sdOk || !SD_MMC.exists(path)) {
+    if (!_sdOk || !sd.exists(path)) {
         Serial.println("[SD] No FACE.BIN found");
         return;
     }
-    File f = SD_MMC.open(path, FILE_READ);
-    if (!f) return;
+    FsFile f;
+    if (!f.open(path, O_RDONLY)) return;
 
-    uint8_t count = f.read();
-    if (count == 0) { f.close(); return; }
+    uint8_t count = 0;
+    if (f.read(&count, 1) != 1 || count == 0) { f.close(); return; }
 
-    l->confirm_times = f.read();
+    uint8_t confirmTimes = 0;
+    f.read(&confirmTimes, 1);
+    l->confirm_times = confirmTimes;
     l->count = 0; l->head = nullptr; l->tail = nullptr;
     const int vsz = FACE_ID_SIZE * sizeof(float);
 
@@ -223,15 +272,15 @@ void read_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  User database
+//  User database  (JSON array at /db/users.txt)
 // ═══════════════════════════════════════════════════════════════════════════════
 String getUsersJSON() {
     if (!_sdOk) return "[]";
-    File f = SD_MMC.open("/db/users.txt");
-    if (!f) return "[]";
-    String s = f.readString();
+    FsFile f;
+    if (!f.open("/db/users.txt", O_RDONLY)) return "[]";
+    String s = sdReadAll(f);
     f.close();
-    return s;
+    return (s.length() > 0) ? s : "[]";
 }
 
 int getUserCount() {
@@ -239,7 +288,7 @@ int getUserCount() {
     int c = 0, depth = 0;
     bool inStr = false;
     for (char ch : j) {
-        if (ch == '"' && (depth == 0 || inStr)) inStr = !inStr;
+        if (ch == '"') inStr = !inStr;
         if (inStr) continue;
         if (ch == '{') { if (++depth == 1) c++; }
         else if (ch == '}') depth--;
@@ -247,47 +296,58 @@ int getUserCount() {
     return c;
 }
 
-bool saveUserToDB(String id, String name, String dept, String role) {
+// saveUserToDB – takes a UserRecord struct instead of four loose Strings.
+bool saveUserToDB(const UserRecord &user) {
     if (!_sdOk) return false;
-    File f = SD_MMC.open("/db/users.txt", FILE_READ);
+
+    FsFile f;
     DynamicJsonDocument doc(8192);
-    if (deserializeJson(doc, f) != DeserializationError::Ok) {
+    if (f.open("/db/users.txt", O_RDONLY)) {
+        if (deserializeJson(doc, f) != DeserializationError::Ok)
+            doc.to<JsonArray>();
         f.close();
-        // Recover with empty array
+    } else {
         doc.to<JsonArray>();
-    } else f.close();
+    }
 
     JsonArray arr = doc.as<JsonArray>();
+    // Reject duplicate names
     for (JsonObject u : arr)
-        if (u["name"] == name) { Serial.println("[DB] User exists"); return false; }
+        if (strcmp(u["name"] | "", user.name) == 0) {
+            Serial.println("[DB] User already exists");
+            return false;
+        }
 
-    JsonObject nu = arr.createNestedObject();
-    nu["id"]       = id;
-    nu["name"]     = name;
-    nu["dept"]     = dept;
-    nu["role"]     = role;
-    nu["regDate"]  = getCurrentDateStr();
-    nu["faces"]    = 5;          // updated after enrollment confirms
+    JsonObject nu  = arr.createNestedObject();
+    nu["id"]      = user.id;
+    nu["name"]    = user.name;
+    nu["dept"]    = user.dept;
+    nu["role"]    = (user.role[0] != '\0') ? user.role : "Student";
+    nu["regDate"] = getCurrentDateStr();
+    nu["faces"]   = 5;   // updated after enrolment completes
 
-    f = SD_MMC.open("/db/users.txt", FILE_WRITE);
+    if (!f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) return false;
     bool ok = serializeJson(doc, f) > 0;
     f.close();
-    Serial.printf("[DB] Saved user %s\n", name.c_str());
+    Serial.printf("[DB] Saved user: %s  id: %s\n", user.name, user.id);
     return ok;
 }
 
-bool deleteUserFromDB(String name) {
+// deleteUserFromDB – takes const char* name instead of String.
+bool deleteUserFromDB(const char *name) {
     if (!_sdOk) return false;
-    File f = SD_MMC.open("/db/users.txt", FILE_READ);
+
+    FsFile f;
+    if (!f.open("/db/users.txt", O_RDONLY)) return false;
     DynamicJsonDocument doc(8192);
     if (deserializeJson(doc, f) != DeserializationError::Ok) { f.close(); return false; }
     f.close();
 
     JsonArray arr = doc.as<JsonArray>();
     for (int i = 0; i < (int)arr.size(); i++) {
-        if (arr[i]["name"] == name) {
+        if (strcmp(arr[i]["name"] | "", name) == 0) {
             arr.remove(i);
-            f = SD_MMC.open("/db/users.txt", FILE_WRITE);
+            if (!f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) return false;
             bool ok = serializeJson(doc, f) > 0;
             f.close();
             return ok;
@@ -299,23 +359,27 @@ bool deleteUserFromDB(String name) {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Attendance logging
 // ═══════════════════════════════════════════════════════════════════════════════
-void logAttendance(String uid, String name, String dept) {
+
+// logAttendance – auto-recognised path. date/time/status are filled here;
+// only rec.uid, rec.name, rec.dept (and optionally rec.confidence) are used.
+void logAttendance(const AttendanceRecord &rec) {
     if (!_sdOk) return;
+
     String date    = getCurrentDateStr();
     String timeStr = getCurrentHHMM();
-    String status  = computeStatus(timeStr);
+    String status  = computeStatus(timeStr.c_str());
     String fname   = "/atd/l_" + date + ".csv";
 
-    // Duplicate check
-    if (SD_MMC.exists(fname.c_str())) {
-        File chk = SD_MMC.open(fname.c_str(), FILE_READ);
-        if (chk) {
-            chk.readStringUntil('\n'); // skip header
+    // Duplicate check – skip if uid already logged today
+    if (sd.exists(fname.c_str())) {
+        FsFile chk;
+        if (chk.open(fname.c_str(), O_RDONLY)) {
+            sdReadLine(chk);  // skip header
             while (chk.available()) {
-                String line = chk.readStringUntil('\n');
-                if (line.indexOf(uid) >= 0) {
+                String line = sdReadLine(chk);
+                if (line.indexOf(rec.uid) >= 0) {
                     chk.close();
-                    Serial.printf("[ATD] %s already logged today\n", name.c_str());
+                    Serial.printf("[ATD] %s already logged today\n", rec.name);
                     return;
                 }
             }
@@ -323,85 +387,113 @@ void logAttendance(String uid, String name, String dept) {
         }
     }
 
-    bool needHeader = !SD_MMC.exists(fname.c_str());
-    File f = SD_MMC.open(fname.c_str(), FILE_APPEND);
-    if (!f) { f = SD_MMC.open(fname.c_str(), FILE_WRITE); needHeader = true; }
-    if (!f) { Serial.println("[ATD] Failed to open log file"); return; }
+    bool needHeader = !sd.exists(fname.c_str());
+    FsFile f;
+    // Try append first; fall back to create
+    if (!f.open(fname.c_str(), O_WRONLY | O_CREAT | O_APPEND)) {
+        Serial.println("[ATD] Failed to open log file");
+        return;
+    }
     if (needHeader) f.println("UID,Name,Department,Date,Time,Status,Confidence");
-    String conf = "92%";   // MTMN doesn't expose a simple % – placeholder
-    f.printf("%s,%s,%s,%s,%s,%s,%s\n",
-             uid.c_str(), name.c_str(), dept.c_str(),
-             date.c_str(), timeStr.c_str(), status.c_str(), conf.c_str());
+
+    const char *conf = (rec.confidence[0] != '\0') ? rec.confidence : "92%";
+    char line[256];
+    snprintf(line, sizeof(line), "%s,%s,%s,%s,%s,%s,%s\n",
+             rec.uid, rec.name, rec.dept,
+             date.c_str(), timeStr.c_str(), status.c_str(), conf);
+    f.print(line);
     f.close();
-    Serial.printf("[ATD] Logged: %s – %s – %s\n", name.c_str(), timeStr.c_str(), status.c_str());
+    Serial.printf("[ATD] Logged: %s – %s – %s\n",
+                  rec.name, timeStr.c_str(), status.c_str());
 }
 
-bool manualAttendance(String uid, String name, String date,
-                      String time, String status, String notes) {
+// manualAttendance – admin override.
+// rec.date / rec.time / rec.status are used as supplied (auto-filled if empty).
+bool manualAttendance(const AttendanceRecord &rec) {
     if (!_sdOk) return false;
-    if (date == "") date = getCurrentDateStr();
-    if (time == "") time = getCurrentHHMM();
 
-    // Lookup name from DB if not provided
-    if (name == "") {
+    // Work with mutable copies so we can fill defaults
+    char date[12]   = {0};
+    char timeStr[6] = {0};
+    char status[16] = {0};
+    char name[64]   = {0};
+
+    strncpy(date,    rec.date[0]   ? rec.date   : getCurrentDateStr().c_str(), 11);
+    strncpy(timeStr, rec.time[0]   ? rec.time   : getCurrentHHMM().c_str(),     5);
+    strncpy(status,  rec.status[0] ? rec.status : "Present",                   15);
+    strncpy(name,    rec.name,                                                  63);
+
+    // If name not in record, look it up from DB by uid
+    if (name[0] == '\0') {
         String j = getUsersJSON();
         DynamicJsonDocument doc(8192);
         if (deserializeJson(doc, j) == DeserializationError::Ok) {
             for (JsonObject u : doc.as<JsonArray>()) {
-                if (u["id"] == uid) { name = u["name"].as<String>(); break; }
+                if (strcmp(u["id"] | "", rec.uid) == 0) {
+                    strncpy(name, u["name"] | "", 63);
+                    break;
+                }
             }
         }
     }
 
-    String fname = "/atd/l_" + date + ".csv";
-    bool needHeader = !SD_MMC.exists(fname.c_str());
+    String fname = "/atd/l_" + String(date) + ".csv";
+    bool needHeader = !sd.exists(fname.c_str());
 
-    // If record already exists for this uid+date, overwrite status in memory
+    // If record exists for this uid today, overwrite the status field in-memory
     if (!needHeader) {
-        File r = SD_MMC.open(fname.c_str(), FILE_READ);
-        String header = r.readStringUntil('\n');
-        String rebuilt = header + "\n";
-        bool replaced = false;
-        while (r.available()) {
-            String line = r.readStringUntil('\n');
-            line.trim();
-            if (line.length() == 0) continue;
-            if (line.startsWith(uid + ",")) {
-                // replace status field (index 5)
-                // "UID,Name,Department,Date,Time,Status,Confidence"
-                //   0   1      2        3    4     5       6
-                int f0=line.indexOf(',');
-                int f1=line.indexOf(',',f0+1);
-                int f2=line.indexOf(',',f1+1);
-                int f3=line.indexOf(',',f2+1);
-                int f4=line.indexOf(',',f3+1);
-                int f5=line.indexOf(',',f4+1);
-                String newLine = line.substring(0,f3+1) + time + "," +
-                                 status + line.substring(f5);
-                rebuilt += newLine + "\n";
-                replaced = true;
-            } else {
-                rebuilt += line + "\n";
+        FsFile r;
+        if (r.open(fname.c_str(), O_RDONLY)) {
+            String header  = sdReadLine(r);
+            String rebuilt = header + "\n";
+            bool replaced  = false;
+
+            while (r.available()) {
+                String line = sdReadLine(r);
+                if (line.length() == 0) continue;
+
+                if (line.startsWith(String(rec.uid) + ",")) {
+                    // CSV: UID,Name,Department,Date,Time,Status,Confidence
+                    //        0   1      2        3    4     5        6
+                    int f0 = line.indexOf(',');
+                    int f1 = line.indexOf(',', f0+1);
+                    int f2 = line.indexOf(',', f1+1);
+                    int f3 = line.indexOf(',', f2+1);
+                    int f4 = line.indexOf(',', f3+1);
+                    int f5 = line.indexOf(',', f4+1);
+                    // Rebuild: keep fields 0-3, replace time+status, keep confidence
+                    String newLine = line.substring(0, f3+1)
+                                   + String(timeStr) + ","
+                                   + String(status)
+                                   + (f5 >= 0 ? line.substring(f5) : "");
+                    rebuilt += newLine + "\n";
+                    replaced = true;
+                } else {
+                    rebuilt += line + "\n";
+                }
             }
-        }
-        r.close();
-        if (replaced) {
-            File w = SD_MMC.open(fname.c_str(), FILE_WRITE);
-            if (!w) return false;
-            w.print(rebuilt);
-            w.close();
-            Serial.printf("[ATD] Manual override: %s -> %s\n", uid.c_str(), status.c_str());
-            return true;
+            r.close();
+
+            if (replaced) {
+                FsFile w;
+                if (!w.open(fname.c_str(), O_WRONLY | O_CREAT | O_TRUNC)) return false;
+                w.print(rebuilt);
+                w.close();
+                Serial.printf("[ATD] Manual override: %s -> %s\n", rec.uid, status);
+                return true;
+            }
         }
     }
 
     // Append new record
-    File f = SD_MMC.open(fname.c_str(), FILE_APPEND);
-    if (!f) { f = SD_MMC.open(fname.c_str(), FILE_WRITE); needHeader = true; }
-    if (!f) return false;
+    FsFile f;
+    if (!f.open(fname.c_str(), O_WRONLY | O_CREAT | O_APPEND)) return false;
     if (needHeader) f.println("UID,Name,Department,Date,Time,Status,Confidence");
-    f.printf("%s,%s,,%s,%s,%s,Manual\n",
-             uid.c_str(), name.c_str(), date.c_str(), time.c_str(), status.c_str());
+
+    char lineBuf[256];
+    snprintf(lineBuf, sizeof(lineBuf), "%s,%s,,%s,%s,%s,Manual\n",
+             rec.uid, name, date, timeStr, status);
+    f.print(lineBuf);
     f.close();
     return true;
 }
@@ -414,13 +506,13 @@ bool manualAttendance(String uid, String name, String date,
 static void parseLogFile(const String &fname, JsonArray &arr,
                          const String &deptFilt, const String &statusFilt,
                          const String &search) {
-    if (!SD_MMC.exists(fname.c_str())) return;
-    File f = SD_MMC.open(fname.c_str(), FILE_READ);
-    if (!f) return;
-    f.readStringUntil('\n'); // skip header
+    if (!sd.exists(fname.c_str())) return;
+    FsFile f;
+    if (!f.open(fname.c_str(), O_RDONLY)) return;
+    sdReadLine(f);   // skip header
+
     while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
+        String line = sdReadLine(f);
         if (line.length() < 3) continue;
         // UID,Name,Department,Date,Time,Status,Confidence
         int c0 = line.indexOf(',');
@@ -436,13 +528,12 @@ static void parseLogFile(const String &fname, JsonArray &arr,
         String dept   = line.substring(c1+1, c2);
         String date   = line.substring(c2+1, c3);
         String time   = line.substring(c3+1, c4);
-        String status = line.substring(c4+1, c5>0?c5:line.length());
+        String status = line.substring(c4+1, c5>0 ? c5 : (int)line.length());
         String conf   = c5>0 ? line.substring(c5+1) : "";
         status.trim(); conf.trim();
 
-        // Apply filters
-        if (deptFilt   != "" && dept   != deptFilt)   continue;
-        if (statusFilt != "" && status != statusFilt)  continue;
+        if (deptFilt   != "" && dept   != deptFilt)  continue;
+        if (statusFilt != "" && status != statusFilt) continue;
         if (search     != "") {
             String sl = search; sl.toLowerCase();
             String nl = name;   nl.toLowerCase();
@@ -450,7 +541,7 @@ static void parseLogFile(const String &fname, JsonArray &arr,
             if (nl.indexOf(sl) < 0 && ul.indexOf(sl) < 0) continue;
         }
 
-        JsonObject obj = arr.createNestedObject();
+        JsonObject obj  = arr.createNestedObject();
         obj["uid"]        = uid;
         obj["name"]       = name;
         obj["dept"]       = dept;
@@ -479,41 +570,41 @@ String getAttendanceLogs() {
 
 String getLogsRange(int days) {
     DynamicJsonDocument doc(4096);
-    JsonObject root = doc.to<JsonObject>();
-    JsonArray labels  = root.createNestedArray("labels");
-    JsonArray present = root.createNestedArray("present");
-    JsonArray absent  = root.createNestedArray("absent");
-    JsonArray late    = root.createNestedArray("late");
+    JsonObject root    = doc.to<JsonObject>();
+    JsonArray  labels  = root.createNestedArray("labels");
+    JsonArray  present = root.createNestedArray("present");
+    JsonArray  absent  = root.createNestedArray("absent");
+    JsonArray  late    = root.createNestedArray("late");
 
     int total   = getUserCount();
     int sumPres = 0;
 
     for (int i = days-1; i >= 0; i--) {
         String dStr = dateStrDaysAgo(i);
-        String lbl  = (days <= 14) ? dayLabel(i) : dStr.substring(5); // "MM-DD" for longer ranges
+        String lbl  = (days <= 14) ? dayLabel(i) : dStr.substring(5);
         labels.add(lbl);
 
         String fname = "/atd/l_" + dStr + ".csv";
         int p=0, a=0, l=0;
-        if (SD_MMC.exists(fname.c_str())) {
-            File f = SD_MMC.open(fname.c_str(), FILE_READ);
-            if (f) {
-                f.readStringUntil('\n');
+        if (sd.exists(fname.c_str())) {
+            FsFile f;
+            if (f.open(fname.c_str(), O_RDONLY)) {
+                sdReadLine(f);   // skip header
                 while (f.available()) {
-                    String line = f.readStringUntil('\n');
-                    line.trim();
+                    String line = sdReadLine(f);
                     if (line.length() < 3) continue;
-                    // Quick status parse: find 5th comma
+                    // Quick status parse: 5th comma field
                     int c=0, pos=-1;
-                    for (int j=0;j<(int)line.length();j++) {
-                        if (line[j]==',') { c++; if(c==5){pos=j;break;} }
+                    for (int j=0; j<(int)line.length(); j++) {
+                        if (line[j]==',') { c++; if(c==5){pos=j; break;} }
                     }
                     if (pos > 0) {
-                        String s = line.substring(pos+1, line.indexOf(',', pos+1)>0?line.indexOf(',',pos+1):line.length());
+                        int end = line.indexOf(',', pos+1);
+                        String s = line.substring(pos+1, end>0 ? end : (int)line.length());
                         s.trim();
-                        if (s == "Present") p++;
-                        else if (s == "Late") l++;
-                        else a++;
+                        if      (s == "Present") p++;
+                        else if (s == "Late")    l++;
+                        else                     a++;
                     }
                 }
                 f.close();
@@ -537,10 +628,12 @@ String getLogsRange(int days) {
 String downloadAttendanceCSV(String date) {
     if (date == "") date = getCurrentDateStr();
     String fname = "/atd/l_" + date + ".csv";
-    if (!SD_MMC.exists(fname.c_str())) return "UID,Name,Department,Date,Time,Status,Confidence\n";
-    File f = SD_MMC.open(fname.c_str(), FILE_READ);
-    if (!f) return "UID,Name,Department,Date,Time,Status,Confidence\n";
-    String c = f.readString();
+    if (!sd.exists(fname.c_str()))
+        return "UID,Name,Department,Date,Time,Status,Confidence\n";
+    FsFile f;
+    if (!f.open(fname.c_str(), O_RDONLY))
+        return "UID,Name,Department,Date,Time,Status,Confidence\n";
+    String c = sdReadAll(f);
     f.close();
     return c;
 }
@@ -548,8 +641,8 @@ String downloadAttendanceCSV(String date) {
 bool clearAttendanceLogs(String date) {
     if (date == "") date = getCurrentDateStr();
     String fname = "/atd/l_" + date + ".csv";
-    if (!SD_MMC.exists(fname.c_str())) return true;
-    return SD_MMC.remove(fname.c_str());
+    if (!sd.exists(fname.c_str())) return true;
+    return sd.remove(fname.c_str());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -559,25 +652,25 @@ String getStatsJSON() {
     String date  = getCurrentDateStr();
     String fname = "/atd/l_" + date + ".csv";
     int p=0, a=0, l=0;
-    if (SD_MMC.exists(fname.c_str())) {
-        File f = SD_MMC.open(fname.c_str(), FILE_READ);
-        if (f) {
-            f.readStringUntil('\n');
+
+    if (sd.exists(fname.c_str())) {
+        FsFile f;
+        if (f.open(fname.c_str(), O_RDONLY)) {
+            sdReadLine(f);  // skip header
             while (f.available()) {
-                String line = f.readStringUntil('\n');
-                line.trim();
+                String line = sdReadLine(f);
                 if (line.length() < 3) continue;
                 int c=0, pos=-1;
-                for (int j=0;j<(int)line.length();j++) {
-                    if (line[j]==',') { c++; if(c==5){pos=j;break;} }
+                for (int j=0; j<(int)line.length(); j++) {
+                    if (line[j]==',') { c++; if(c==5){pos=j; break;} }
                 }
                 if (pos > 0) {
-                    String s = line.substring(pos+1,
-                        line.indexOf(',',pos+1)>0?line.indexOf(',',pos+1):line.length());
+                    int end = line.indexOf(',', pos+1);
+                    String s = line.substring(pos+1, end>0?end:(int)line.length());
                     s.trim();
-                    if (s=="Present") p++;
-                    else if (s=="Late") l++;
-                    else a++;
+                    if      (s=="Present") p++;
+                    else if (s=="Late")    l++;
+                    else                   a++;
                 }
             }
             f.close();
@@ -586,11 +679,13 @@ String getStatsJSON() {
 
     int total = getUserCount();
 
-    // Storage
+    // Storage (SdFat API)
     String storageStr = "--";
     if (_sdOk) {
-        uint64_t used = SD_MMC.usedBytes() / 1024;
-        storageStr = String((double)used) + " KB";
+        uint64_t used = (uint64_t)sd.card()->sectorCount() * 512
+                      - (uint64_t)sd.vol()->freeClusterCount()
+                          * sd.vol()->bytesPerCluster();
+        storageStr = String((double)used / 1024.0) + " KB";
     }
 
     // Uptime
@@ -617,26 +712,35 @@ String getStatsJSON() {
 String getStorageJSON() {
     DynamicJsonDocument doc(256);
     if (_sdOk) {
-        doc["total"] = String((double)SD_MMC.totalBytes() / (1024*1024)) + " MB";
-        doc["used"]  = String((double)SD_MMC.usedBytes()  / (1024*1024)) + " MB";
-        doc["free"]  = String((double)(SD_MMC.totalBytes()-SD_MMC.usedBytes()) / (1024*1024)) + " MB";
-        doc["pct"]   = (int)((double)SD_MMC.usedBytes()/SD_MMC.totalBytes()*100);
+        uint64_t totalBytes = (uint64_t)sd.card()->sectorCount() * 512;
+        uint64_t freeBytes  = (uint64_t)sd.vol()->freeClusterCount()
+                                       * sd.vol()->bytesPerCluster();
+        uint64_t usedBytes  = totalBytes - freeBytes;
+
+        doc["total"] = String((double)totalBytes / (1024.0*1024.0)) + " MB";
+        doc["used"]  = String((double)usedBytes  / (1024.0*1024.0)) + " MB";
+        doc["free"]  = String((double)freeBytes  / (1024.0*1024.0)) + " MB";
+        doc["pct"]   = (totalBytes > 0) ? (int)((double)usedBytes/totalBytes*100) : 0;
     } else {
         doc["total"] = "--"; doc["used"] = "--"; doc["free"] = "--"; doc["pct"] = 0;
     }
-    String out; serializeJson(doc, out); return out;
+    String out;
+    serializeJson(doc, out);
+    return out;
 }
 
 String getStatusJSON() {
     DynamicJsonDocument doc(256);
-    doc["camera"]    = true;   // If we got here, camera initialised OK
+    doc["camera"]    = true;
     doc["wifi"]      = (WiFi.status() == WL_CONNECTED);
     doc["model"]     = (id_list.count > 0);
     doc["faceCount"] = (int)id_list.count;
     doc["ip"]        = WiFi.localIP().toString();
     doc["ssid"]      = String(gSettings.ssid);
     doc["ntpSynced"] = ntpSynced;
-    String out; serializeJson(doc, out); return out;
+    String out;
+    serializeJson(doc, out);
+    return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -654,8 +758,9 @@ bool saveSettings(const AttendanceSettings &s) {
     doc["autoMode"]      = s.autoMode;
     doc["gmtOffsetSec"]  = s.gmtOffsetSec;
     doc["ntpServer"]     = s.ntpServer;
-    File f = SD_MMC.open("/cfg/settings.json", FILE_WRITE);
-    if (!f) return false;
+
+    FsFile f;
+    if (!f.open("/cfg/settings.json", O_WRONLY | O_CREAT | O_TRUNC)) return false;
     bool ok = serializeJson(doc, f) > 0;
     f.close();
     Serial.println("[CFG] Settings saved");
@@ -664,16 +769,18 @@ bool saveSettings(const AttendanceSettings &s) {
 
 bool loadSettings(AttendanceSettings &s) {
     setDefaultSettings(s);   // always start with defaults
-    if (!_sdOk || !SD_MMC.exists("/cfg/settings.json")) return false;
-    File f = SD_MMC.open("/cfg/settings.json", FILE_READ);
-    if (!f) return false;
+    if (!_sdOk || !sd.exists("/cfg/settings.json")) return false;
+
+    FsFile f;
+    if (!f.open("/cfg/settings.json", O_RDONLY)) return false;
     DynamicJsonDocument doc(512);
     if (deserializeJson(doc, f) != DeserializationError::Ok) { f.close(); return false; }
     f.close();
-    if (doc.containsKey("startTime"))     strncpy(s.startTime,    doc["startTime"],    5);
-    if (doc.containsKey("endTime"))       strncpy(s.endTime,      doc["endTime"],      5);
-    if (doc.containsKey("lateTime"))      strncpy(s.lateTime,     doc["lateTime"],     5);
-    if (doc.containsKey("absentTime"))    strncpy(s.absentTime,   doc["absentTime"],   5);
+
+    if (doc.containsKey("startTime"))     strncpy(s.startTime,   doc["startTime"],  5);
+    if (doc.containsKey("endTime"))       strncpy(s.endTime,     doc["endTime"],    5);
+    if (doc.containsKey("lateTime"))      strncpy(s.lateTime,    doc["lateTime"],   5);
+    if (doc.containsKey("absentTime"))    strncpy(s.absentTime,  doc["absentTime"], 5);
     if (doc.containsKey("confidence"))    s.confidence    = doc["confidence"];
     if (doc.containsKey("buzzerEnabled")) s.buzzerEnabled = doc["buzzerEnabled"];
     if (doc.containsKey("autoMode"))      s.autoMode      = doc["autoMode"];

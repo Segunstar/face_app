@@ -1,5 +1,5 @@
 // app_httpd.cpp  –  FaceGuard Pro (ESP32-CAM)
-// HTTP server with all API endpoints for the new admin portal.
+// HTTP server with all API endpoints for the admin portal.
 
 #define LOG_LOCAL_LEVEL ESP_LOG_INFO
 
@@ -36,14 +36,15 @@ bool authenticated = false;
 const char *myFilePath = "/FACE.BIN";
 
 // ─── Face detection / recognition config (defined here, extern in global.h) ──
-mtmn_config_t mtmn_config  = {0};
-face_id_name_list id_list   = {0};
-int8_t detection_enabled    = 0;
-int8_t recognition_enabled  = 0;
-int8_t is_enrolling         = 0;
-String newUserId            = "";
-String newUserName          = "";
-String newUserDept          = "";
+mtmn_config_t     mtmn_config       = {0};
+face_id_name_list id_list            = {0};
+int8_t            detection_enabled  = 0;
+int8_t            recognition_enabled = 0;
+int8_t            is_enrolling        = 0;
+
+// ─── Enrolment context (replaces three loose String globals) ─────────────────
+// Set by api_enroll_capture_handler; read by run_face_recognition.
+EnrollContext enrollCtx = {};
 
 // ─── MJPEG streaming constants ────────────────────────────────────────────────
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -63,9 +64,9 @@ httpd_handle_t camera_httpd = NULL;
 #define FACE_COLOR_GREEN  0x0000FF00
 #define FACE_COLOR_YELLOW (FACE_COLOR_RED | FACE_COLOR_GREEN)
 
-// ─── Helper: URL-decode a string (simple %XX decoder) ─────────────────────────
+// ─── Helper: URL-decode a string ──────────────────────────────────────────────
 static String urlDecode(const char *src) {
-    String out = "";
+    String out;
     char a, b;
     while (*src) {
         if ((*src == '%') && ((a = src[1]) && (b = src[2])) &&
@@ -78,7 +79,7 @@ static String urlDecode(const char *src) {
         } else if (*src == '+') {
             out += ' '; src++;
         } else {
-            out += *src++; 
+            out += *src++;
         }
     }
     return out;
@@ -123,10 +124,10 @@ static void draw_face_boxes(dl_matrix3du_t *im, box_array_t *boxes, int fid) {
 
 // ─── Face recognition runner ──────────────────────────────────────────────────
 static int run_face_recognition(dl_matrix3du_t *im, box_array_t *net_boxes,
-                                 const String &name) {
+                                 const char *enrollName) {
     char cname[ENROLL_NAME_LEN];
-    strncpy(cname, name.c_str(), ENROLL_NAME_LEN-1);
-    cname[ENROLL_NAME_LEN-1] = 0;
+    strncpy(cname, enrollName, ENROLL_NAME_LEN-1);
+    cname[ENROLL_NAME_LEN-1] = '\0';
 
     dl_matrix3du_t *aligned = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
     if (!aligned) return 0;
@@ -134,6 +135,7 @@ static int run_face_recognition(dl_matrix3du_t *im, box_array_t *net_boxes,
 
     if (align_face(net_boxes, im, aligned) == ESP_OK) {
         dl_matrix3d_t *face_id = get_face_id(aligned);
+
         if (is_enrolling == 1) {
             int8_t left = enroll_face_with_name(&id_list, face_id, cname);
             if (left == 0) {
@@ -148,8 +150,10 @@ static int run_face_recognition(dl_matrix3du_t *im, box_array_t *net_boxes,
             if (node) {
                 matched = 1;
                 rgb_print(im, FACE_COLOR_GREEN, "Recognised");
-                // Log attendance (runs on stream task, so keep it brief)
-                Bridge::logAttendance(String(node->id_name), String(node->id_name), "");
+                // Log attendance via AttendanceRecord struct
+                AttendanceRecord rec = AttendanceRecord::fromFace(
+                    node->id_name, node->id_name, "");
+                Bridge::logAttendance(rec);
             } else {
                 rgb_print(im, FACE_COLOR_RED, "Unknown");
                 matched = -1;
@@ -165,12 +169,12 @@ static int run_face_recognition(dl_matrix3du_t *im, box_array_t *net_boxes,
 //  STREAM HANDLER (port 81)
 // ══════════════════════════════════════════════════════════════════════════════
 static esp_err_t stream_handler(httpd_req_t *req) {
-    camera_fb_t *fb = NULL;
-    struct timeval ts;
-    esp_err_t res = ESP_OK;
-    size_t jpg_len = 0;
-    uint8_t *jpg_buf = NULL;
-    char part_buf[128];
+    camera_fb_t    *fb           = NULL;
+    struct timeval  ts;
+    esp_err_t       res          = ESP_OK;
+    size_t          jpg_len      = 0;
+    uint8_t        *jpg_buf      = NULL;
+    char            part_buf[128];
     dl_matrix3du_t *image_matrix = NULL;
 
     httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
@@ -198,7 +202,9 @@ static esp_err_t stream_handler(httpd_req_t *req) {
                     if (boxes) {
                         int fid = 0;
                         if (recognition_enabled)
-                            fid = run_face_recognition(image_matrix, boxes, newUserName);
+                            // Pass enrollCtx.name into the recognition runner
+                            fid = run_face_recognition(image_matrix, boxes,
+                                                       enrollCtx.name);
                         draw_face_boxes(image_matrix, boxes, fid);
                         dl_lib_free(boxes->score); dl_lib_free(boxes->box);
                         if (boxes->landmark) dl_lib_free(boxes->landmark);
@@ -238,7 +244,6 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 //  PAGE HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Chunked HTML sender – safe for large PROGMEM strings
 static esp_err_t send_progmem_html(httpd_req_t *req, const char *html) {
     httpd_resp_set_type(req, "text/html");
     const size_t CHUNK = 2048;
@@ -303,17 +308,9 @@ static esp_err_t send_json(httpd_req_t *req, const String &json) {
 //  DASHBOARD / STATUS API
 // ══════════════════════════════════════════════════════════════════════════════
 
-static esp_err_t api_stats_handler(httpd_req_t *req) {
-    return send_json(req, Bridge::getStatsJSON());
-}
-
-static esp_err_t api_status_handler(httpd_req_t *req) {
-    return send_json(req, Bridge::getStatusJSON());
-}
-
-static esp_err_t api_storage_handler(httpd_req_t *req) {
-    return send_json(req, Bridge::getStorageJSON());
-}
+static esp_err_t api_stats_handler   (httpd_req_t *req) { return send_json(req, Bridge::getStatsJSON());   }
+static esp_err_t api_status_handler  (httpd_req_t *req) { return send_json(req, Bridge::getStatusJSON());  }
+static esp_err_t api_storage_handler (httpd_req_t *req) { return send_json(req, Bridge::getStorageJSON()); }
 
 static esp_err_t api_sync_ntp_handler(httpd_req_t *req) {
     Bridge::syncNTP();
@@ -329,7 +326,7 @@ static esp_err_t api_users_handler(httpd_req_t *req) {
     return send_json(req, Bridge::getUsersJSON());
 }
 
-// Runtime face list deletion helper
+// Runtime face-list deletion helper
 static int8_t delete_face_runtime(face_id_name_list *l, const char *name) {
     if (l->count == 0) return -1;
     face_id_node *p = l->head, *prev = NULL;
@@ -352,7 +349,7 @@ static esp_err_t api_delete_handler(httpd_req_t *req) {
     if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
         char name[64] = {0};
         if (httpd_query_key_value(buf, "name", name, sizeof(name)) == ESP_OK) {
-            Bridge::deleteUserFromDB(String(name));
+            Bridge::deleteUserFromDB(name);   // now takes const char*
             if (delete_face_runtime(&id_list, name) == 0) {
                 Bridge::write_face_id_name_list_sdcard(&id_list, myFilePath);
                 Serial.printf("[DB] Deleted user '%s'\n", name);
@@ -373,13 +370,14 @@ static esp_err_t api_enroll_mode_handler(httpd_req_t *req) {
         char val[4];
         if (httpd_query_key_value(buf, "active", val, sizeof(val)) == ESP_OK) {
             if (atoi(val) == 1) {
-                detection_enabled   = 1;
-                recognition_enabled = 1;
+                detection_enabled    = 1;
+                recognition_enabled  = 1;
                 Serial.println("[ENROLL] Enrol mode ON");
             } else {
-                detection_enabled   = 0;
-                recognition_enabled = 0;
-                is_enrolling        = 0;
+                detection_enabled    = 0;
+                recognition_enabled  = 0;
+                is_enrolling         = 0;
+                memset(&enrollCtx, 0, sizeof(enrollCtx));
                 Serial.println("[ENROLL] Enrol mode OFF");
             }
         }
@@ -394,14 +392,22 @@ static esp_err_t api_enroll_capture_handler(httpd_req_t *req) {
         char id[32]={0}, name[64]={0}, dept[64]={0};
         if (httpd_query_key_value(buf, "id",   id,   sizeof(id))   == ESP_OK &&
             httpd_query_key_value(buf, "name", name, sizeof(name)) == ESP_OK) {
+
             httpd_query_key_value(buf, "dept", dept, sizeof(dept));
-            newUserName = urlDecode(name);
-            newUserDept = urlDecode(dept);
-            newUserId   = urlDecode(id);
-            Bridge::saveUserToDB(newUserId, newUserName, newUserDept);
+
+            // Fill EnrollContext struct (replaces newUserId / newUserName / newUserDept)
+            strncpy(enrollCtx.id,   urlDecode(id).c_str(),   sizeof(enrollCtx.id)   - 1);
+            strncpy(enrollCtx.name, urlDecode(name).c_str(), sizeof(enrollCtx.name) - 1);
+            strncpy(enrollCtx.dept, urlDecode(dept).c_str(), sizeof(enrollCtx.dept) - 1);
+
+            // Save user to DB using UserRecord struct
+            UserRecord user = UserRecord::make(enrollCtx.id, enrollCtx.name,
+                                               enrollCtx.dept, "Student");
+            Bridge::saveUserToDB(user);
+
             is_enrolling = 1;
             Serial.printf("[ENROLL] Capturing for '%s' (id=%s)\n",
-                          newUserName.c_str(), newUserId.c_str());
+                          enrollCtx.name, enrollCtx.id);
             set_cors_headers(req);
             return httpd_resp_send(req, "Capturing...", HTTPD_RESP_USE_STRLEN);
         }
@@ -448,22 +454,24 @@ static esp_err_t api_manual_handler(httpd_req_t *req) {
     char *buf = (char*)malloc(len+1);
     if (!buf) return httpd_resp_send_500(req);
     int ret = httpd_req_recv(req, buf, len);
-    buf[ret > 0 ? ret : 0] = 0;
+    buf[ret > 0 ? ret : 0] = '\0';
     String body = String(buf);
     free(buf);
 
-    String uid    = getFormField(body, "uid");
-    String name   = getFormField(body, "name");
-    String date   = getFormField(body, "date");
-    String status = getFormField(body, "status");
-    String time   = getFormField(body, "time");
-    String notes  = getFormField(body, "notes");
+    // Build AttendanceRecord from form fields (replaces 6 loose String locals)
+    AttendanceRecord rec = {};
+    strncpy(rec.uid,    getFormField(body, "uid").c_str(),    sizeof(rec.uid)    - 1);
+    strncpy(rec.name,   getFormField(body, "name").c_str(),   sizeof(rec.name)   - 1);
+    strncpy(rec.date,   getFormField(body, "date").c_str(),   sizeof(rec.date)   - 1);
+    strncpy(rec.status, getFormField(body, "status").c_str(), sizeof(rec.status) - 1);
+    strncpy(rec.time,   getFormField(body, "time").c_str(),   sizeof(rec.time)   - 1);
+    strncpy(rec.notes,  getFormField(body, "notes").c_str(),  sizeof(rec.notes)  - 1);
 
-    if (uid.length() == 0) {
+    if (rec.uid[0] == '\0') {
         set_cors_headers(req);
         return httpd_resp_send(req, "FAIL: uid required", HTTPD_RESP_USE_STRLEN);
     }
-    bool ok = Bridge::manualAttendance(uid, name, date, time, status, notes);
+    bool ok = Bridge::manualAttendance(rec);
     set_cors_headers(req);
     return httpd_resp_send(req, ok ? "OK" : "FAIL: write error", HTTPD_RESP_USE_STRLEN);
 }
@@ -480,7 +488,8 @@ static esp_err_t api_download_csv_handler(httpd_req_t *req) {
     String csv = Bridge::downloadAttendanceCSV(date);
     set_cors_headers(req);
     httpd_resp_set_type(req, "text/csv");
-    String fname = "attachment; filename=attendance_" + (date.length() ? date : Bridge::getCurrentDateStr()) + ".csv";
+    String fname = "attachment; filename=attendance_"
+                 + (date.length() ? date : Bridge::getCurrentDateStr()) + ".csv";
     httpd_resp_set_hdr(req, "Content-Disposition", fname.c_str());
     return httpd_resp_send(req, csv.c_str(), (ssize_t)csv.length());
 }
@@ -505,7 +514,6 @@ static esp_err_t api_clear_logs_handler(httpd_req_t *req) {
 
 // GET /api/settings
 static esp_err_t api_settings_get_handler(httpd_req_t *req) {
-    // Build JSON from gSettings
     char j[512];
     snprintf(j, sizeof(j),
         "{\"startTime\":\"%s\",\"endTime\":\"%s\","
@@ -529,7 +537,7 @@ static esp_err_t api_settings_post_handler(httpd_req_t *req) {
     char *buf = (char*)malloc(len+1);
     if (!buf) return httpd_resp_send_500(req);
     int ret = httpd_req_recv(req, buf, len);
-    buf[ret > 0 ? ret : 0] = 0;
+    buf[ret > 0 ? ret : 0] = '\0';
     String body = String(buf);
     free(buf);
 
@@ -541,8 +549,8 @@ static esp_err_t api_settings_post_handler(httpd_req_t *req) {
     s = getFormField(body, "ntpServer");    if (s.length()) strncpy(gSettings.ntpServer,    s.c_str(), 63);
     s = getFormField(body, "gmtOffsetSec"); if (s.length()) gSettings.gmtOffsetSec = s.toInt();
     s = getFormField(body, "confidence");   if (s.length()) gSettings.confidence   = s.toInt();
-    s = getFormField(body, "buzzerEnabled");gSettings.buzzerEnabled = (s == "1");
-    s = getFormField(body, "autoMode");     gSettings.autoMode      = (s == "1");
+    s = getFormField(body, "buzzerEnabled"); gSettings.buzzerEnabled = (s == "1");
+    s = getFormField(body, "autoMode");      gSettings.autoMode      = (s == "1");
 
     Bridge::saveSettings(gSettings);
     Serial.println("[CFG] Settings updated via portal");
@@ -554,7 +562,6 @@ static esp_err_t api_settings_post_handler(httpd_req_t *req) {
 //  startCameraServer()
 // ══════════════════════════════════════════════════════════════════════════════
 void startCameraServer() {
-    // ── MTMN config ──────────────────────────────────────────────────────────
     mtmn_config.type                         = FAST;
     mtmn_config.min_face                     = 80;
     mtmn_config.pyramid                      = 0.707f;
@@ -575,36 +582,34 @@ void startCameraServer() {
     Bridge::read_face_id_name_list_sdcard(&id_list, myFilePath);
 #endif
 
-    // ── HTTP config ───────────────────────────────────────────────────────────
-    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    httpd_config_t cfg  = HTTPD_DEFAULT_CONFIG();
     cfg.max_uri_handlers = 24;
     cfg.stack_size       = 8192;
 
-    // URI table (all on port 80)
     httpd_uri_t uris[] = {
-        {"/",                    HTTP_GET,  index_handler,              NULL},
-        {"/login",               HTTP_POST, login_post_handler,         NULL},
-        {"/logout",              HTTP_GET,  logout_handler,             NULL},
+        {"/",                     HTTP_GET,  index_handler,              NULL},
+        {"/login",                HTTP_POST, login_post_handler,         NULL},
+        {"/logout",               HTTP_GET,  logout_handler,             NULL},
         // Dashboard
-        {"/api/stats",           HTTP_GET,  api_stats_handler,          NULL},
-        {"/api/status",          HTTP_GET,  api_status_handler,         NULL},
-        {"/api/storage",         HTTP_GET,  api_storage_handler,        NULL},
-        {"/api/sync_ntp",        HTTP_GET,  api_sync_ntp_handler,       NULL},
+        {"/api/stats",            HTTP_GET,  api_stats_handler,          NULL},
+        {"/api/status",           HTTP_GET,  api_status_handler,         NULL},
+        {"/api/storage",          HTTP_GET,  api_storage_handler,        NULL},
+        {"/api/sync_ntp",         HTTP_GET,  api_sync_ntp_handler,       NULL},
         // Users
-        {"/api/users",           HTTP_GET,  api_users_handler,          NULL},
-        {"/api/delete_user",     HTTP_GET,  api_delete_handler,         NULL},
+        {"/api/users",            HTTP_GET,  api_users_handler,          NULL},
+        {"/api/delete_user",      HTTP_GET,  api_delete_handler,         NULL},
         // Enrolment
-        {"/api/enroll_mode",     HTTP_GET,  api_enroll_mode_handler,    NULL},
-        {"/api/enroll_capture",  HTTP_GET,  api_enroll_capture_handler, NULL},
+        {"/api/enroll_mode",      HTTP_GET,  api_enroll_mode_handler,    NULL},
+        {"/api/enroll_capture",   HTTP_GET,  api_enroll_capture_handler, NULL},
         // Attendance
-        {"/api/logs",            HTTP_GET,  api_logs_handler,           NULL},
-        {"/api/logs_range",      HTTP_GET,  api_logs_range_handler,     NULL},
-        {"/api/manual_attendance",HTTP_POST,api_manual_handler,         NULL},
-        {"/api/download_csv",    HTTP_GET,  api_download_csv_handler,   NULL},
-        {"/api/clear_logs",      HTTP_GET,  api_clear_logs_handler,     NULL},
+        {"/api/logs",             HTTP_GET,  api_logs_handler,           NULL},
+        {"/api/logs_range",       HTTP_GET,  api_logs_range_handler,     NULL},
+        {"/api/manual_attendance",HTTP_POST, api_manual_handler,         NULL},
+        {"/api/download_csv",     HTTP_GET,  api_download_csv_handler,   NULL},
+        {"/api/clear_logs",       HTTP_GET,  api_clear_logs_handler,     NULL},
         // Settings
-        {"/api/settings",        HTTP_GET,  api_settings_get_handler,   NULL},
-        {"/api/settings",        HTTP_POST, api_settings_post_handler,  NULL},
+        {"/api/settings",         HTTP_GET,  api_settings_get_handler,   NULL},
+        {"/api/settings",         HTTP_POST, api_settings_post_handler,  NULL},
     };
 
     if (httpd_start(&camera_httpd, &cfg) == ESP_OK) {
@@ -615,7 +620,7 @@ void startCameraServer() {
         Serial.println("[HTTP] Failed to start main server!");
     }
 
-    // ── Stream server on port 81 ──────────────────────────────────────────────
+    // Stream server on port 81
     cfg.server_port += 1;
     cfg.ctrl_port   += 1;
     httpd_uri_t stream_uri = {"/stream", HTTP_GET, stream_handler, NULL};
