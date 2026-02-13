@@ -302,7 +302,7 @@ void logAttendance(String uid, String name, String dept) {
     String date    = getCurrentDateStr();
     String timeStr = getCurrentHHMM();
     String status  = computeStatus(timeStr);
-    String fname   = "/atd/log_" + date + ".csv";
+    String fname   = "/atd/l_" + date + ".csv";
 
     // Duplicate check
     if (SD_MMC.exists(fname.c_str())) {
@@ -351,7 +351,7 @@ bool manualAttendance(String uid, String name, String date,
         }
     }
 
-    String fname = "/atd/log_" + date + ".csv";
+    String fname = "/atd/l_" + date + ".csv";
     bool needHeader = !SD_MMC.exists(fname.c_str());
 
     // If record already exists for this uid+date, overwrite status in memory
@@ -462,7 +462,7 @@ static void parseLogFile(const String &fname, JsonArray &arr,
 
 String getLogsJSON(String date, String dept, String status, String search) {
     if (date == "") date = getCurrentDateStr();
-    String fname = "/atd/log_" + date + ".csv";
+    String fname = "/atd/l_" + date + ".csv";
     DynamicJsonDocument doc(16384);
     JsonArray arr = doc.to<JsonArray>();
     parseLogFile(fname, arr, dept, status, search);
@@ -491,7 +491,7 @@ String getLogsRange(int days) {
         String lbl  = (days <= 14) ? dayLabel(i) : dStr.substring(5); // "MM-DD" for longer ranges
         labels.add(lbl);
 
-        String fname = "/atd/log_" + dStr + ".csv";
+        String fname = "/atd/l_" + dStr + ".csv";
         int p=0, a=0, l=0;
         if (SD_MMC.exists(fname.c_str())) {
             File f = SD_MMC.open(fname.c_str(), FILE_READ);
@@ -534,7 +534,7 @@ String getLogsRange(int days) {
 
 String downloadAttendanceCSV(String date) {
     if (date == "") date = getCurrentDateStr();
-    String fname = "/atd/log_" + date + ".csv";
+    String fname = "/atd/l_" + date + ".csv";
     if (!SD_MMC.exists(fname.c_str())) return "UID,Name,Department,Date,Time,Status,Confidence\n";
     File f = SD_MMC.open(fname.c_str(), FILE_READ);
     if (!f) return "UID,Name,Department,Date,Time,Status,Confidence\n";
@@ -545,7 +545,7 @@ String downloadAttendanceCSV(String date) {
 
 bool clearAttendanceLogs(String date) {
     if (date == "") date = getCurrentDateStr();
-    String fname = "/atd/log_" + date + ".csv";
+    String fname = "/atd/l_" + date + ".csv";
     if (!SD_MMC.exists(fname.c_str())) return true;
     return SD_MMC.remove(fname.c_str());
 }
@@ -555,7 +555,7 @@ bool clearAttendanceLogs(String date) {
 // ═══════════════════════════════════════════════════════════════════════════════
 String getStatsJSON() {
     String date  = getCurrentDateStr();
-    String fname = "/atd/log_" + date + ".csv";
+    String fname = "/atd/l_" + date + ".csv";
     int p=0, a=0, l=0;
     if (SD_MMC.exists(fname.c_str())) {
         File f = SD_MMC.open(fname.c_str(), FILE_READ);

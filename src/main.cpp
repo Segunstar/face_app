@@ -20,8 +20,9 @@
 
 // ─── WiFi credentials ─────────────────────────────────────────────────────────
 // UPDATE THESE to match your network before flashing!
-const char *ssid     = "YourSSID";
-const char *password = "YourPassword";
+const char* ssid = "itel RS4";
+const char* password = "Asdf1234";
+
 
 // ─── Global definitions (declared extern in global.h) ────────────────────────
 bool                 isAttendanceMode    = true;
