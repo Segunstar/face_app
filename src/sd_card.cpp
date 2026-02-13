@@ -9,10 +9,21 @@
 #include "Arduino.h"
 
 // ── SdFat replaces Arduino SD_MMC + FS ───────────────────────────────────────
-#include <SdFat.h>          // greiman/SdFat v2
+// SdFat's SdioConfig(FIFO_SDIO) is Teensy-only; on ESP32-CAM we drive the card
+// via SPI using the four MMC pins that are exposed in 1-bit mode.
+#include <SdFat.h>          // greiman/SdFat v2 – LFN on FAT32/exFAT
 #include <sdios.h>
 
 #include "SPI.h"
+
+// ── AI-Thinker ESP32-CAM SD SPI pin mapping ──────────────────────────────────
+// In 1-bit SPI mode only DATA0/CLK/CMD/CS are used; DATA1-3 (GPIO 4,12 etc.)
+// are left free, so the flash LED on GPIO 4 still works normally.
+#define SD_CS    13   // DATA3 / CS
+#define SD_MOSI  15   // CMD   / MOSI
+#define SD_MISO   2   // DATA0 / MISO
+#define SD_SCK   14   // CLK   / SCK
+
 #include <ArduinoJson.h>
 #include <time.h>
 #include <WiFi.h>
@@ -25,13 +36,15 @@
 static bool    _sdOk      = false;
 static time_t  _bootEpoch = 0;   // epoch at first NTP sync (for uptime calc)
 
-// SdFs supports FAT16 / FAT32 / exFAT and enables LFN automatically.
-// FIFO_SDIO uses the ESP32 hardware SDMMC peripheral (same pins as SD_MMC).
-static SdFs sd;
+// SdFat32 handles FAT32 (the format used by every ESP32-CAM microSD card)
+// and enables full LFN (long filename) support when built with
+// -D USE_LONG_FILE_NAMES=255.
+// File handles are File32 — the native type for SdFat32.
+static SdFat32 sd;
 
 // ─── Internal line-reader helper ─────────────────────────────────────────────
-// Reads one '\n'-terminated line from an open FsFile into a String.
-static String sdReadLine(FsFile &f) {
+// Reads one '\n'-terminated line from an open File32 into a String.
+static String sdReadLine(File32 &f) {
     String line;
     line.reserve(128);
     int c;
@@ -43,7 +56,7 @@ static String sdReadLine(FsFile &f) {
 }
 
 // ─── Internal whole-file reader ──────────────────────────────────────────────
-static String sdReadAll(FsFile &f) {
+static String sdReadAll(File32 &f) {
     uint32_t sz = (uint32_t)f.fileSize();
     if (sz == 0) return "";
     char *buf = (char*)malloc(sz + 1);
@@ -82,7 +95,7 @@ String getCurrentDateStr() {
     if (ntpSynced) {
         struct tm ti;
         if (getLocalTime(&ti)) {
-            char buf[12];
+            char buf[32];   // 32 > worst-case int digits + separators + NUL
             snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
                      ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday);
             return String(buf);
@@ -98,7 +111,7 @@ String getCurrentTimeStr() {
     if (ntpSynced) {
         struct tm ti;
         if (getLocalTime(&ti)) {
-            char buf[10];
+            char buf[32];   // 32 > worst-case int digits + separators + NUL
             snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
                      ti.tm_hour, ti.tm_min, ti.tm_sec);
             return String(buf);
@@ -135,7 +148,7 @@ static String dateStrDaysAgo(int daysAgo) {
     time_t now  = time(nullptr);
     time_t then = now - (time_t)daysAgo * 86400;
     struct tm *ti = localtime(&then);
-    char buf[12];
+    char buf[32];   // 32 > worst-case int digits + separators + NUL
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
              ti->tm_year+1900, ti->tm_mon+1, ti->tm_mday);
     return String(buf);
@@ -153,9 +166,10 @@ static String computeStatus(const char *hhmm) {
 //  SD Initialisation
 // ═══════════════════════════════════════════════════════════════════════════════
 void initSD() {
-    // SdioConfig(FIFO_SDIO) uses ESP32 hardware SDMMC peripheral.
-    // Use DMA_SDIO for slightly better throughput if FIFO gives issues.
-    if (!sd.begin(SdioConfig(FIFO_SDIO))) {
+    // Start the SPI bus on the ESP32-CAM's SD card pins, then mount with SdFat.
+    // SD_SCK_MHZ(20) is a safe speed; raise to 25 if you need more throughput.
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    if (!sd.begin(SdSpiConfig(SD_CS, DEDICATED_SPI, SD_SCK_MHZ(20), &SPI))) {
         Serial.println("[SD] Mount failed – check card and connections");
         _sdOk = false;
         return;
@@ -173,7 +187,7 @@ void initSD() {
 
     // Bootstrap empty user DB
     if (!sd.exists("/db/users.txt")) {
-        FsFile f;
+        File32 f;
         if (f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) {
             f.print("[]");
             f.close();
@@ -186,7 +200,7 @@ void initSD() {
 //  Directory listing
 // ═══════════════════════════════════════════════════════════════════════════════
 void listDir(const char *dirname, uint8_t levels) {
-    FsFile dir, entry;
+    File32 dir, entry;
     if (!dir.open(dirname, O_RDONLY)) return;
 
     while (entry.openNext(&dir, O_RDONLY)) {
@@ -214,7 +228,7 @@ void listDir(const char *dirname, uint8_t levels) {
 // ═══════════════════════════════════════════════════════════════════════════════
 void write_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
     if (!_sdOk) return;
-    FsFile f;
+    File32 f;
     if (!f.open(path, O_WRONLY | O_CREAT | O_TRUNC)) {
         Serial.println("[SD] write FACE.BIN failed");
         return;
@@ -243,7 +257,7 @@ void read_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
         Serial.println("[SD] No FACE.BIN found");
         return;
     }
-    FsFile f;
+    File32 f;
     if (!f.open(path, O_RDONLY)) return;
 
     uint8_t count = 0;
@@ -276,7 +290,7 @@ void read_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
 // ═══════════════════════════════════════════════════════════════════════════════
 String getUsersJSON() {
     if (!_sdOk) return "[]";
-    FsFile f;
+    File32 f;
     if (!f.open("/db/users.txt", O_RDONLY)) return "[]";
     String s = sdReadAll(f);
     f.close();
@@ -300,7 +314,7 @@ int getUserCount() {
 bool saveUserToDB(const UserRecord &user) {
     if (!_sdOk) return false;
 
-    FsFile f;
+    File32 f;
     DynamicJsonDocument doc(8192);
     if (f.open("/db/users.txt", O_RDONLY)) {
         if (deserializeJson(doc, f) != DeserializationError::Ok)
@@ -337,7 +351,7 @@ bool saveUserToDB(const UserRecord &user) {
 bool deleteUserFromDB(const char *name) {
     if (!_sdOk) return false;
 
-    FsFile f;
+    File32 f;
     if (!f.open("/db/users.txt", O_RDONLY)) return false;
     DynamicJsonDocument doc(8192);
     if (deserializeJson(doc, f) != DeserializationError::Ok) { f.close(); return false; }
@@ -372,7 +386,7 @@ void logAttendance(const AttendanceRecord &rec) {
 
     // Duplicate check – skip if uid already logged today
     if (sd.exists(fname.c_str())) {
-        FsFile chk;
+        File32 chk;
         if (chk.open(fname.c_str(), O_RDONLY)) {
             sdReadLine(chk);  // skip header
             while (chk.available()) {
@@ -388,7 +402,7 @@ void logAttendance(const AttendanceRecord &rec) {
     }
 
     bool needHeader = !sd.exists(fname.c_str());
-    FsFile f;
+    File32 f;
     // Try append first; fall back to create
     if (!f.open(fname.c_str(), O_WRONLY | O_CREAT | O_APPEND)) {
         Serial.println("[ATD] Failed to open log file");
@@ -442,7 +456,7 @@ bool manualAttendance(const AttendanceRecord &rec) {
 
     // If record exists for this uid today, overwrite the status field in-memory
     if (!needHeader) {
-        FsFile r;
+        File32 r;
         if (r.open(fname.c_str(), O_RDONLY)) {
             String header  = sdReadLine(r);
             String rebuilt = header + "\n";
@@ -475,7 +489,7 @@ bool manualAttendance(const AttendanceRecord &rec) {
             r.close();
 
             if (replaced) {
-                FsFile w;
+                File32 w;
                 if (!w.open(fname.c_str(), O_WRONLY | O_CREAT | O_TRUNC)) return false;
                 w.print(rebuilt);
                 w.close();
@@ -486,7 +500,7 @@ bool manualAttendance(const AttendanceRecord &rec) {
     }
 
     // Append new record
-    FsFile f;
+    File32 f;
     if (!f.open(fname.c_str(), O_WRONLY | O_CREAT | O_APPEND)) return false;
     if (needHeader) f.println("UID,Name,Department,Date,Time,Status,Confidence");
 
@@ -507,7 +521,7 @@ static void parseLogFile(const String &fname, JsonArray &arr,
                          const String &deptFilt, const String &statusFilt,
                          const String &search) {
     if (!sd.exists(fname.c_str())) return;
-    FsFile f;
+    File32 f;
     if (!f.open(fname.c_str(), O_RDONLY)) return;
     sdReadLine(f);   // skip header
 
@@ -587,7 +601,7 @@ String getLogsRange(int days) {
         String fname = "/atd/l_" + dStr + ".csv";
         int p=0, a=0, l=0;
         if (sd.exists(fname.c_str())) {
-            FsFile f;
+            File32 f;
             if (f.open(fname.c_str(), O_RDONLY)) {
                 sdReadLine(f);   // skip header
                 while (f.available()) {
@@ -630,7 +644,7 @@ String downloadAttendanceCSV(String date) {
     String fname = "/atd/l_" + date + ".csv";
     if (!sd.exists(fname.c_str()))
         return "UID,Name,Department,Date,Time,Status,Confidence\n";
-    FsFile f;
+    File32 f;
     if (!f.open(fname.c_str(), O_RDONLY))
         return "UID,Name,Department,Date,Time,Status,Confidence\n";
     String c = sdReadAll(f);
@@ -654,7 +668,7 @@ String getStatsJSON() {
     int p=0, a=0, l=0;
 
     if (sd.exists(fname.c_str())) {
-        FsFile f;
+        File32 f;
         if (f.open(fname.c_str(), O_RDONLY)) {
             sdReadLine(f);  // skip header
             while (f.available()) {
@@ -679,13 +693,14 @@ String getStatsJSON() {
 
     int total = getUserCount();
 
-    // Storage (SdFat API)
+    // Storage (SdFat32 API)
     String storageStr = "--";
     if (_sdOk) {
-        uint64_t used = (uint64_t)sd.card()->sectorCount() * 512
-                      - (uint64_t)sd.vol()->freeClusterCount()
-                          * sd.vol()->bytesPerCluster();
-        storageStr = String((double)used / 1024.0) + " KB";
+        uint32_t bytesPerCluster = sd.vol()->bytesPerCluster();
+        uint32_t usedClusters    = sd.vol()->clusterCount()
+                                 - sd.vol()->freeClusterCount();
+        uint64_t usedBytes       = (uint64_t)usedClusters * bytesPerCluster;
+        storageStr = String((double)usedBytes / 1024.0) + " KB";
     }
 
     // Uptime
@@ -712,15 +727,17 @@ String getStatsJSON() {
 String getStorageJSON() {
     DynamicJsonDocument doc(256);
     if (_sdOk) {
-        uint64_t totalBytes = (uint64_t)sd.card()->sectorCount() * 512;
-        uint64_t freeBytes  = (uint64_t)sd.vol()->freeClusterCount()
-                                       * sd.vol()->bytesPerCluster();
-        uint64_t usedBytes  = totalBytes - freeBytes;
+        uint32_t bytesPerCluster = sd.vol()->bytesPerCluster();
+        uint32_t totalClusters   = sd.vol()->clusterCount();
+        uint32_t freeClusters    = sd.vol()->freeClusterCount();
+        uint64_t totalBytes      = (uint64_t)totalClusters * bytesPerCluster;
+        uint64_t freeBytes       = (uint64_t)freeClusters  * bytesPerCluster;
+        uint64_t usedBytes       = totalBytes - freeBytes;
 
         doc["total"] = String((double)totalBytes / (1024.0*1024.0)) + " MB";
         doc["used"]  = String((double)usedBytes  / (1024.0*1024.0)) + " MB";
         doc["free"]  = String((double)freeBytes  / (1024.0*1024.0)) + " MB";
-        doc["pct"]   = (totalBytes > 0) ? (int)((double)usedBytes/totalBytes*100) : 0;
+        doc["pct"]   = (totalBytes > 0) ? (int)((double)usedBytes / totalBytes * 100) : 0;
     } else {
         doc["total"] = "--"; doc["used"] = "--"; doc["free"] = "--"; doc["pct"] = 0;
     }
@@ -759,7 +776,7 @@ bool saveSettings(const AttendanceSettings &s) {
     doc["gmtOffsetSec"]  = s.gmtOffsetSec;
     doc["ntpServer"]     = s.ntpServer;
 
-    FsFile f;
+    File32 f;
     if (!f.open("/cfg/settings.json", O_WRONLY | O_CREAT | O_TRUNC)) return false;
     bool ok = serializeJson(doc, f) > 0;
     f.close();
@@ -771,7 +788,7 @@ bool loadSettings(AttendanceSettings &s) {
     setDefaultSettings(s);   // always start with defaults
     if (!_sdOk || !sd.exists("/cfg/settings.json")) return false;
 
-    FsFile f;
+    File32 f;
     if (!f.open("/cfg/settings.json", O_RDONLY)) return false;
     DynamicJsonDocument doc(512);
     if (deserializeJson(doc, f) != DeserializationError::Ok) { f.close(); return false; }
