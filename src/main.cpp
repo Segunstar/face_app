@@ -26,6 +26,7 @@
 #include "esp_camera.h"
 #include "sd_card.h"
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include "fd_forward.h"
 #include "fr_forward.h"
 #include "image_util.h"
@@ -38,6 +39,22 @@
 const char* ssid     = "itel RS4";
 const char* password = "Asdf1234";
 
+// ─── Static IP configuration ──────────────────────────────────────────────────
+// Change these to match your network. The device will always be reachable at
+// STATIC_IP regardless of DHCP. Also reachable at http://faceguard.local
+// via mDNS (no IP needed at all on any modern device on the same network).
+//
+// To find your gateway: on Windows run  ipconfig  → "Default Gateway"
+//                        on Linux/Mac  run  ip route | grep default
+//
+// static const IPAddress STATIC_IP (192, 168, 1, 184); // ← change last octet as needed
+// static const IPAddress GATEWAY   (192, 168, 1,   1); // ← your router IP
+// static const IPAddress SUBNET    (255, 255, 255,  0);
+// static const IPAddress DNS       (  8,   8,   8,  8); // Google DNS (or use gateway)
+
+// mDNS hostname – device will be reachable at http://faceguard.local
+#define MDNS_NAME "faceguard"
+
 // ─── Global definitions (declared extern in global.h) ────────────────────────
 bool                isAttendanceMode     = true;
 unsigned long       lastRecognitionTime  = 0;  // set only on a successful match
@@ -48,7 +65,6 @@ bool                ntpSynced            = false;
 AttendanceSettings  gSettings;
 
 // ─── Minimum free heap before attempting matrix allocation ────────────────────
-// face_detect() + aligned matrix need ~80 KB; guard at 100 KB to be safe.
 #define MIN_FREE_HEAP_BYTES  (100 * 1024)
 
 // ─── Forward declarations ────────────────────────────────────────────────────
@@ -83,7 +99,7 @@ static bool initCamera() {
     if (psramFound()) {
         config.frame_size   = FRAMESIZE_UXGA;
         config.jpeg_quality = 12;
-        config.fb_count     = 2;   // 2 prevents DMA starvation / JPG errors
+        config.fb_count     = 2;
     } else {
         config.frame_size   = FRAMESIZE_SVGA;
         config.jpeg_quality = 12;
@@ -102,7 +118,7 @@ static bool initCamera() {
         s->set_brightness(s, 1);
         s->set_saturation(s, -2);
     }
-    s->set_framesize(s, FRAMESIZE_QVGA);  // required for face recognition
+    s->set_framesize(s, FRAMESIZE_QVGA);
     Serial.println("[CAM] Initialised OK");
     return true;
 }
@@ -112,11 +128,9 @@ void setup() {
     Serial.begin(115200);
     Serial.println("\n\n=== FaceGuard Pro v2.0 ===");
 
-    // 0) Feedback hardware – initialise before anything else so LEDs are
-    //    deterministically OFF from the first moment of power-on.
+    // 0) Feedback hardware
     pinMode(GREEN_LED_GPIO, OUTPUT); digitalWrite(GREEN_LED_GPIO, LOW);
     pinMode(RED_LED_GPIO,   OUTPUT); digitalWrite(RED_LED_GPIO,   LOW);
-    // BUZZER_GPIO_NUM == RED_LED_GPIO on this board, so the above covers it.
     Serial.println("[HW]  LEDs + buzzer GPIO initialised");
 
     // 1) SD card + settings
@@ -130,8 +144,9 @@ void setup() {
         while (true) delay(1000);
     }
 
-    // 3) WiFi
+    // 3) WiFi – static IP assigned before connecting so DHCP is never involved
     strncpy(gSettings.ssid, ssid, sizeof(gSettings.ssid) - 1);
+    // WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS);
     WiFi.begin(ssid, password);
     Serial.print("[WiFi] Connecting");
     int tries = 0;
@@ -141,6 +156,15 @@ void setup() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[WiFi] Connected – IP: %s\n",
                       WiFi.localIP().toString().c_str());
+
+        // Start mDNS so device is reachable at http://faceguard.local
+        if (MDNS.begin(MDNS_NAME)) {
+            MDNS.addService("http", "tcp", 80);
+            MDNS.addService("stream", "tcp", 81);
+            Serial.printf("[mDNS] Reachable at http://%s.local\n", MDNS_NAME);
+        } else {
+            Serial.println("[mDNS] Failed to start – IP access still works");
+        }
     } else {
         Serial.println("\n[WiFi] Connection failed – running without network");
     }
@@ -153,24 +177,16 @@ void setup() {
     // 5) Face recognition model init
     initFaceRecognition();
 
-    // 6) HTTP server (runs its own tasks internally, stays on CPU 1)
+    // 6) HTTP server
     startCameraServer();
 
-    // 7) Attendance task – pinned to CPU 0, away from httpd on CPU 1.
-    //    Stack 8 KB is enough for the face pipeline; priority 1 keeps it below
-    //    the idle priority so it never blocks the WDT feed.
+    // 7) Attendance task – pinned to CPU 0
     xTaskCreatePinnedToCore(
-        attendanceTask,  // function
-        "atd",           // name (shown in WDT logs)
-        8192,            // stack bytes
-        NULL,            // parameter
-        1,               // priority
-        NULL,            // handle (not needed)
-        0                // CPU core 0
+        attendanceTask, "atd", 8192, NULL, 1, NULL, 0
     );
 
-    Serial.printf("\n[READY] Admin portal:  http://%s\n",
-                  WiFi.localIP().toString().c_str());
+    Serial.printf("\n[READY] Admin portal:  http://%s  or  http://%s.local\n",
+                  WiFi.localIP().toString().c_str(), MDNS_NAME);
     Serial.printf("[READY] Stream:        http://%s:81/stream\n",
                   WiFi.localIP().toString().c_str());
     Serial.println("[READY] Login: admin / 1234");
@@ -202,37 +218,27 @@ void initFaceRecognition() {
 }
 
 // ─── Feedback helpers ─────────────────────────────────────────────────────────
-// Both use vTaskDelay so they yield CPU while waiting —
-// safe to call from inside attendanceTask (pinned to CPU 0).
-
-// Called when a face is matched and attendance is logged.
-// Pattern: green LED solid + two short buzzer beeps.
 static void feedbackRecognised() {
-    digitalWrite(GREEN_LED_GPIO, HIGH);  // green on for full duration
+    digitalWrite(GREEN_LED_GPIO, HIGH);
 
-    // Beep 1
     digitalWrite(BUZZER_GPIO_NUM, HIGH);
     vTaskDelay(pdMS_TO_TICKS(120));
     digitalWrite(BUZZER_GPIO_NUM, LOW);
 
-    vTaskDelay(pdMS_TO_TICKS(120));      // gap between beeps
+    vTaskDelay(pdMS_TO_TICKS(120));
 
-    // Beep 2
     digitalWrite(BUZZER_GPIO_NUM, HIGH);
     vTaskDelay(pdMS_TO_TICKS(120));
     digitalWrite(BUZZER_GPIO_NUM, LOW);
 
-    vTaskDelay(pdMS_TO_TICKS(200));      // hold green so it registers visually
+    vTaskDelay(pdMS_TO_TICKS(200));
     digitalWrite(GREEN_LED_GPIO, LOW);
 }
 
-// Called when a face is detected but not in the enrolled database.
-// Pattern: red LED + long continuous buzz for 600 ms.
 static void feedbackNotRecognised() {
-    // RED_LED_GPIO == BUZZER_GPIO_NUM — one write covers both.
-    digitalWrite(RED_LED_GPIO, HIGH);   // red LED on + buzzer on
+    digitalWrite(RED_LED_GPIO, HIGH);
     vTaskDelay(pdMS_TO_TICKS(600));
-    digitalWrite(RED_LED_GPIO, LOW);    // red LED off + buzzer off
+    digitalWrite(RED_LED_GPIO, LOW);
 }
 
 // ─── attendanceTask() – FreeRTOS task pinned to CPU 0 ────────────────────────
@@ -243,7 +249,6 @@ static void attendanceTask(void *pvParameters) {
     Serial.println("[ATD] Task started on CPU 0");
 
     while (true) {
-        // ── Gate checks ──────────────────────────────────────────────────────
         if (!isAttendanceMode || !gSettings.autoMode) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
@@ -251,12 +256,6 @@ static void attendanceTask(void *pvParameters) {
 
         unsigned long now = millis();
 
-        // ── Two independent cooldowns ─────────────────────────────────────────
-        // ATTEMPT_COOLDOWN (500 ms): throttles face_detect() frequency.
-        //   Retries quickly on missed/unrecognised faces.
-        //
-        // RECOGNITION_COOLDOWN (5000 ms): only armed after a successful match.
-        //   Prevents the same person being logged twice in one session.
         if (now - lastAttemptTime < ATTEMPT_COOLDOWN) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
@@ -266,10 +265,8 @@ static void attendanceTask(void *pvParameters) {
             continue;
         }
 
-        // Stamp the attempt regardless of outcome (throttles CPU, stops spam)
         lastAttemptTime = now;
 
-        // ── Heap guard ───────────────────────────────────────────────────────
         if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < MIN_FREE_HEAP_BYTES) {
             Serial.printf("[ATD] Low heap (%lu B) – skipping frame\n",
                           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_8BIT));
@@ -277,14 +274,9 @@ static void attendanceTask(void *pvParameters) {
             continue;
         }
 
-        // ── Grab frame ───────────────────────────────────────────────────────
         camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
+        if (!fb) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
 
-        // ── Convert to RGB888 ────────────────────────────────────────────────
         dl_matrix3du_t *im = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
         if (!im) {
             esp_camera_fb_return(fb);
@@ -293,15 +285,11 @@ static void attendanceTask(void *pvParameters) {
         }
 
         bool converted = fmt2rgb888(fb->buf, fb->len, fb->format, im->item);
-        esp_camera_fb_return(fb);  // release ASAP so stream can reuse it
+        esp_camera_fb_return(fb);
         fb = nullptr;
 
-        if (!converted) {
-            dl_matrix3du_free(im);
-            continue;
-        }
+        if (!converted) { dl_matrix3du_free(im); continue; }
 
-        // ── Face detection ───────────────────────────────────────────────────
         box_array_t *boxes = face_detect(im, &mtmn_config);
 
         if (boxes) {
@@ -316,16 +304,12 @@ static void attendanceTask(void *pvParameters) {
                     AttendanceRecord rec = AttendanceRecord::fromFace(
                         match->id_name, match->id_name, "");
                     Bridge::logAttendance(rec);
-                    lastRecognitionTime = now; // start the 5s no-relog window
+                    lastRecognitionTime = now;
 
-                    if (gSettings.buzzerEnabled) {
-                        feedbackRecognised();  // green flash + two short beeps
-                    }
+                    if (gSettings.buzzerEnabled) feedbackRecognised();
                 } else {
                     Serial.println("[ATD] Face detected but not recognised");
-                    if (gSettings.buzzerEnabled) {
-                        feedbackNotRecognised();  // red flash + long buzz
-                    }
+                    if (gSettings.buzzerEnabled) feedbackNotRecognised();
                 }
                 dl_matrix3d_free(fid);
             }
@@ -338,15 +322,11 @@ static void attendanceTask(void *pvParameters) {
         }
 
         dl_matrix3du_free(im);
-
-        // Yield to let the scheduler breathe between inference cycles.
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
-// ─── loop() – nothing heavy lives here any more ───────────────────────────────
-// Arduino's loop() runs on CPU 1 alongside httpd. Keeping it minimal means
-// httpd gets clean scheduling and the CPU 1 IDLE task always feeds the WDT.
+// ─── loop() ──────────────────────────────────────────────────────────────────
 void loop() {
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
