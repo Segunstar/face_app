@@ -19,7 +19,8 @@
 // ── AI-Thinker ESP32-CAM SD SPI pin mapping ──────────────────────────────────
 // In 1-bit SPI mode only DATA0/CLK/CMD/CS are used; DATA1-3 (GPIO 4,12 etc.)
 // are left free, so the flash LED on GPIO 4 still works normally.
-#define SD_CS    13   // DATA3 / CS
+// #define SD_CS    13   // DATA3 / CS
+#define SD_CS    33   // CS  – moved to GPIO 33 to free GPIO 13 for red LED/buzzer
 #define SD_MOSI  15   // CMD   / MOSI
 #define SD_MISO   2   // DATA0 / MISO
 #define SD_SCK   14   // CLK   / SCK
