@@ -19,7 +19,6 @@
 // ── AI-Thinker ESP32-CAM SD SPI pin mapping ──────────────────────────────────
 // In 1-bit SPI mode only DATA0/CLK/CMD/CS are used; DATA1-3 (GPIO 4,12 etc.)
 // are left free, so the flash LED on GPIO 4 still works normally.
-// #define SD_CS    13   // DATA3 / CS
 #define SD_CS    33   // CS  – moved to GPIO 33 to free GPIO 13 for red LED/buzzer
 #define SD_MOSI  15   // CMD   / MOSI
 #define SD_MISO   2   // DATA0 / MISO
@@ -78,8 +77,11 @@ void syncNTP() {
     configTime(gSettings.gmtOffsetSec, 0, gSettings.ntpServer);
     struct tm ti;
     int retries = 0;
-    while (!getLocalTime(&ti) && retries++ < 10) delay(500);
-    if (retries < 10) {
+    // getLocalTime(tm, timeout_ms) — pass 1000 ms so each attempt is short.
+    // Without the explicit timeout it defaults to ~5000 ms per call, causing
+    // up to 60 seconds of blocking when NTP is unreachable (10 × 6 s ≈ 60 s).
+    while (!getLocalTime(&ti, 1000) && retries++ < 10) delay(200);
+    if (retries <= 10 && getLocalTime(&ti, 1000)) {
         ntpSynced  = true;
         _bootEpoch = time(nullptr);
         Serial.printf("[NTP] Synced. Date: %04d-%02d-%02d  Time: %02d:%02d:%02d\n",
@@ -197,9 +199,41 @@ void initSD() {
     Serial.println("[SD] Ready  (LFN enabled via SdFat)");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Directory listing
-// ═══════════════════════════════════════════════════════════════════════════════
+// ─── SD state ────────────────────────────────────────────────────────────────
+bool sdIsOk() { return _sdOk; }
+
+// ─── Raw FACE.BIN helpers ─────────────────────────────────────────────────────
+size_t getFaceBinSize() {
+    if (!_sdOk || !sd.exists("/FACE.BIN")) return 0;
+    File32 f;
+    if (!f.open("/FACE.BIN", O_RDONLY)) return 0;
+    size_t sz = (size_t)f.fileSize();
+    f.close();
+    return sz;
+}
+
+bool readFaceBinRaw(uint8_t *buf, size_t len) {
+    if (!_sdOk) return false;
+    File32 f;
+    if (!f.open("/FACE.BIN", O_RDONLY)) return false;
+    bool ok = ((size_t)f.read(buf, len) == len);
+    f.close();
+    return ok;
+}
+
+bool writeFaceBinRaw(const uint8_t *buf, size_t len) {
+    if (!_sdOk) return false;
+    File32 f;
+    if (!f.open("/FACE.BIN", O_WRONLY | O_CREAT | O_TRUNC)) return false;
+    bool ok = ((size_t)f.write(buf, len) == len);
+    f.close();
+    return ok;
+}
+
+// ─── Date helper (public) ────────────────────────────────────────────────────
+String getDateDaysAgo(int daysAgo) { return dateStrDaysAgo(daysAgo); }
+
+
 void listDir(const char *dirname, uint8_t levels) {
     File32 dir, entry;
     if (!dir.open(dirname, O_RDONLY)) return;
@@ -371,12 +405,36 @@ bool deleteUserFromDB(const char *name) {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Attendance logging
-// ═══════════════════════════════════════════════════════════════════════════════
+// getUserByName – looks up a user in /db/users.txt by their display name.
+// 'name' is what the face recognition library stores in FACE.BIN (id_name).
+// Fills 'out' with the full record: id, name, dept, role.
+// Returns true if found, false if not in DB (out is unchanged).
+bool getUserByName(const char *name, UserRecord &out) {
+    if (!_sdOk) return false;
+    File32 f;
+    if (!f.open("/db/users.txt", O_RDONLY)) return false;
 
-// logAttendance – auto-recognised path. date/time/status are filled here;
-// only rec.uid, rec.name, rec.dept (and optionally rec.confidence) are used.
+    DynamicJsonDocument doc(8192);
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (err != DeserializationError::Ok) return false;
+
+    for (JsonObject u : doc.as<JsonArray>()) {
+        if (strcmp(u["name"] | "", name) == 0) {
+            memset(&out, 0, sizeof(out));
+            strncpy(out.id,   u["id"]   | name, sizeof(out.id)   - 1);
+            strncpy(out.name, u["name"] | name, sizeof(out.name) - 1);
+            strncpy(out.dept, u["dept"] | "",   sizeof(out.dept) - 1);
+            strncpy(out.role, u["role"] | "Student", sizeof(out.role) - 1);
+            return true;
+        }
+    }
+    return false;  // not found – caller should fall back to name-only
+}
+
+// logAttendance – auto path.
+// Uses rec.uid / rec.name / rec.dept as input.
+// date / time / status are computed here from the current clock.
 void logAttendance(const AttendanceRecord &rec) {
     if (!_sdOk) return;
 
@@ -395,7 +453,7 @@ void logAttendance(const AttendanceRecord &rec) {
                 if (line.indexOf(rec.uid) >= 0) {
                     chk.close();
                     Serial.printf("[ATD] %s already logged today\n", rec.name);
-                    return;
+                    return;  // duplicate
                 }
             }
             chk.close();
@@ -404,7 +462,6 @@ void logAttendance(const AttendanceRecord &rec) {
 
     bool needHeader = !sd.exists(fname.c_str());
     File32 f;
-    // Try append first; fall back to create
     if (!f.open(fname.c_str(), O_WRONLY | O_CREAT | O_APPEND)) {
         Serial.println("[ATD] Failed to open log file");
         return;
@@ -418,8 +475,8 @@ void logAttendance(const AttendanceRecord &rec) {
              date.c_str(), timeStr.c_str(), status.c_str(), conf);
     f.print(line);
     f.close();
-    Serial.printf("[ATD] Logged: %s – %s – %s\n",
-                  rec.name, timeStr.c_str(), status.c_str());
+    Serial.printf("[ATD] Logged: %s (%s) – %s – %s\n",
+                  rec.name, rec.uid, timeStr.c_str(), status.c_str());
 }
 
 // manualAttendance – admin override.

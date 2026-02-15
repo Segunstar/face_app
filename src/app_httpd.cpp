@@ -150,9 +150,23 @@ static int run_face_recognition(dl_matrix3du_t *im, box_array_t *net_boxes,
             if (node) {
                 matched = 1;
                 rgb_print(im, FACE_COLOR_GREEN, "Recognised");
-                // Log attendance via AttendanceRecord struct
-                AttendanceRecord rec = AttendanceRecord::fromFace(
-                    node->id_name, node->id_name, "");
+
+                // Look up the full user record from users.txt by name.
+                // match->id_name is just the display name stored in FACE.BIN.
+                // getUserByName fills in the proper uid and dept.
+                UserRecord user;
+                bool found = Bridge::getUserByName(node->id_name, user);
+
+                AttendanceRecord rec = {};
+                if (found) {
+                    strncpy(rec.uid,  user.id,   sizeof(rec.uid)  - 1);
+                    strncpy(rec.name, user.name, sizeof(rec.name) - 1);
+                    strncpy(rec.dept, user.dept, sizeof(rec.dept) - 1);
+                } else {
+                    // User not in DB (enrolled but not registered) – use name as fallback
+                    strncpy(rec.uid,  node->id_name, sizeof(rec.uid)  - 1);
+                    strncpy(rec.name, node->id_name, sizeof(rec.name) - 1);
+                }
                 Bridge::logAttendance(rec);
             } else {
                 rgb_print(im, FACE_COLOR_RED, "Unknown");
@@ -349,7 +363,7 @@ static esp_err_t api_delete_handler(httpd_req_t *req) {
     if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
         char name[64] = {0};
         if (httpd_query_key_value(buf, "name", name, sizeof(name)) == ESP_OK) {
-            Bridge::deleteUserFromDB(name);   // now takes const char*
+            Bridge::deleteUserFromDB(name);
             if (delete_face_runtime(&id_list, name) == 0) {
                 Bridge::write_face_id_name_list_sdcard(&id_list, myFilePath);
                 Serial.printf("[DB] Deleted user '%s'\n", name);
