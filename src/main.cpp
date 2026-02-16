@@ -37,7 +37,8 @@
 #include "fd_forward.h"
 #include "fr_forward.h"
 #include "image_util.h"
-
+// #include "soc/soc.h"
+// #include "soc/rtc_cntl_reg.h"
 #define CAMERA_MODEL_AI_THINKER
 #include "camera_pins.h"
 #include "global.h"
@@ -122,6 +123,7 @@ static bool initCamera() {
 
 // ─── setup() ─────────────────────────────────────────────────────────────────
 void setup() {
+    // WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector
     Serial.begin(115200);
     Serial.println("\n\n=== FaceGuard Pro v2.0 ===");
 
@@ -129,7 +131,9 @@ void setup() {
     //    deterministically OFF from the first moment of power-on.
     pinMode(GREEN_LED_GPIO,  OUTPUT); digitalWrite(GREEN_LED_GPIO,  LOW);
     pinMode(RED_LED_GPIO,    OUTPUT); digitalWrite(RED_LED_GPIO,    LOW);
-    // BUZZER_GPIO_NUM == RED_LED_GPIO on this board, so the above covers it.
+    pinMode(BUZZER_GPIO_NUM, OUTPUT); digitalWrite(BUZZER_GPIO_NUM, LOW);
+    // GPIO 12 = green LED, GPIO 13 = red LED, GPIO 1 = buzzer (TX pin)
+    // All three are now independent – red can no longer bleed into recognised feedback.
     Serial.println("[HW]  LEDs + buzzer GPIO initialised");
 
     // 1) SD card + settings
@@ -249,10 +253,11 @@ static void feedbackRecognised() {
 // Called when a face is detected but not in the enrolled database.
 // Pattern: red LED + long continuous buzz for 600 ms.
 static void feedbackNotRecognised() {
-    // RED_LED_GPIO == BUZZER_GPIO_NUM on this board — one write covers both.
-    digitalWrite(RED_LED_GPIO, HIGH);      // red LED on + buzzer on
+    digitalWrite(RED_LED_GPIO,    HIGH);  // red LED on
+    digitalWrite(BUZZER_GPIO_NUM, HIGH);  // buzzer on  (GPIO 1 – independent)
     vTaskDelay(pdMS_TO_TICKS(600));
-    digitalWrite(RED_LED_GPIO, LOW);       // red LED off + buzzer off
+    digitalWrite(RED_LED_GPIO,    LOW);
+    digitalWrite(BUZZER_GPIO_NUM, LOW);
 }
 
 // ─── attendanceTask() – FreeRTOS task pinned to CPU 0 ────────────────────────
