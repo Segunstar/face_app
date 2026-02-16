@@ -123,6 +123,7 @@ static bool initCamera() {
 
 // ─── setup() ─────────────────────────────────────────────────────────────────
 void setup() {
+    esp_task_wdt_init(30, true);  // extend WDT to 30s – httpd SD handlers need headroom
     // WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector
     Serial.begin(115200);
     Serial.println("\n\n=== FaceGuard Pro v2.0 ===");

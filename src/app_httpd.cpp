@@ -15,6 +15,7 @@
 #include "fr_forward.h"
 #include "global.h"
 #include "sd_card.h"
+#include "esp_task_wdt.h"
 
 #include <sys/time.h>
 #include <algorithm>
@@ -322,9 +323,18 @@ static esp_err_t send_json(httpd_req_t *req, const String &json) {
 //  DASHBOARD / STATUS API
 // ══════════════════════════════════════════════════════════════════════════════
 
-static esp_err_t api_stats_handler   (httpd_req_t *req) { return send_json(req, Bridge::getStatsJSON());   }
-static esp_err_t api_status_handler  (httpd_req_t *req) { return send_json(req, Bridge::getStatusJSON());  }
-static esp_err_t api_storage_handler (httpd_req_t *req) { return send_json(req, Bridge::getStorageJSON()); }
+static esp_err_t api_stats_handler(httpd_req_t *req) {
+    esp_task_wdt_reset();
+    return send_json(req, Bridge::getStatsJSON());
+}
+static esp_err_t api_status_handler(httpd_req_t *req) {
+    esp_task_wdt_reset();
+    return send_json(req, Bridge::getStatusJSON());
+}
+static esp_err_t api_storage_handler(httpd_req_t *req) {
+    esp_task_wdt_reset();
+    return send_json(req, Bridge::getStorageJSON());
+}
 
 static esp_err_t api_sync_ntp_handler(httpd_req_t *req) {
     Bridge::syncNTP();
@@ -337,6 +347,7 @@ static esp_err_t api_sync_ntp_handler(httpd_req_t *req) {
 // ══════════════════════════════════════════════════════════════════════════════
 
 static esp_err_t api_users_handler(httpd_req_t *req) {
+    esp_task_wdt_reset();
     return send_json(req, Bridge::getUsersJSON());
 }
 
@@ -444,6 +455,7 @@ static esp_err_t api_logs_handler(httpd_req_t *req) {
         if (httpd_query_key_value(buf, "status", tmp, sizeof(tmp)) == ESP_OK) status = String(tmp);
         if (httpd_query_key_value(buf, "search", tmp, sizeof(tmp)) == ESP_OK) search = urlDecode(tmp);
     }
+    esp_task_wdt_reset();
     return send_json(req, Bridge::getLogsJSON(date, dept, status, search));
 }
 
@@ -458,6 +470,7 @@ static esp_err_t api_logs_range_handler(httpd_req_t *req) {
     }
     if (days < 1)  days = 1;
     if (days > 90) days = 90;
+    esp_task_wdt_reset();
     return send_json(req, Bridge::getLogsRange(days));
 }
 
@@ -485,6 +498,7 @@ static esp_err_t api_manual_handler(httpd_req_t *req) {
         set_cors_headers(req);
         return httpd_resp_send(req, "FAIL: uid required", HTTPD_RESP_USE_STRLEN);
     }
+    esp_task_wdt_reset();
     bool ok = Bridge::manualAttendance(rec);
     set_cors_headers(req);
     return httpd_resp_send(req, ok ? "OK" : "FAIL: write error", HTTPD_RESP_USE_STRLEN);
@@ -499,6 +513,7 @@ static esp_err_t api_download_csv_handler(httpd_req_t *req) {
         if (httpd_query_key_value(buf, "date", tmp, sizeof(tmp)) == ESP_OK)
             date = String(tmp);
     }
+    esp_task_wdt_reset();
     String csv = Bridge::downloadAttendanceCSV(date);
     set_cors_headers(req);
     httpd_resp_set_type(req, "text/csv");
