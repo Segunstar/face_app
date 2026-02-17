@@ -17,7 +17,7 @@ extern face_id_name_list id_list;
 // ─── Web-server control flags ────────────────────────────────────────────────
 extern int8_t detection_enabled;
 extern int8_t recognition_enabled;
-extern int8_t is_enrolling;
+extern volatile int8_t is_enrolling;
 extern bool   authenticated;
 
 // ─── Hardware pins ────────────────────────────────────────────────────────────

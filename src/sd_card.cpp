@@ -42,6 +42,20 @@ static time_t  _bootEpoch = 0;   // epoch at first NTP sync (for uptime calc)
 // File handles are File32 — the native type for SdFat32.
 static SdFat32 sd;
 
+// ─── Cross-task SD access guard ──────────────────────────────────────────────
+// The ATD task, stream handler (httpd task) and HTTP API handlers all access
+// the SD card concurrently.  SdFat's SHARED_SPI mode serialises SPI-level
+// transactions, but we also need to serialise at the SdFat object level
+// (file descriptors, directory state, etc.).
+// Using a recursive mutex so helper functions that call other SD helpers
+// (e.g. getUserCount → getUsersJSON) don't self-deadlock.
+static SemaphoreHandle_t _sdMutex = nullptr;
+
+// Convenience macros — return a default value if the mutex can't be taken
+// within 2 s (should never happen in normal operation).
+#define SD_TAKE()   (xSemaphoreTakeRecursive(_sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE)
+#define SD_GIVE()   xSemaphoreGiveRecursive(_sdMutex)
+
 // ─── Internal line-reader helper ─────────────────────────────────────────────
 // Reads one '\n'-terminated line from an open File32 into a String.
 static String sdReadLine(File32 &f) {
@@ -169,10 +183,21 @@ static String computeStatus(const char *hhmm) {
 //  SD Initialisation
 // ═══════════════════════════════════════════════════════════════════════════════
 void initSD() {
-    // Start the SPI bus on the ESP32-CAM's SD card pins, then mount with SdFat.
-    // SD_SCK_MHZ(20) is a safe speed; raise to 25 if you need more throughput.
+    // Create the cross-task SD mutex BEFORE any SD operation.
+    // Recursive so helpers that call other helpers don't self-deadlock.
+    if (!_sdMutex) {
+        _sdMutex = xSemaphoreCreateRecursiveMutex();
+        configASSERT(_sdMutex);
+    }
+
+    // SHARED_SPI (not DEDICATED_SPI): DEDICATED_SPI takes the Arduino SPI mutex
+    // once in begin() and never releases it, causing the FreeRTOS
+    // "xQueueGenericSend queue.c:832" assert when the ATD task or httpd task
+    // later calls endTransaction() from a different task context.
+    // SHARED_SPI calls beginTransaction/endTransaction around every command,
+    // keeping take/give in the same task.
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    if (!sd.begin(SdSpiConfig(SD_CS, DEDICATED_SPI, SD_SCK_MHZ(20), &SPI))) {
+    if (!sd.begin(SdSpiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(20), &SPI))) {
         Serial.println("[SD] Mount failed – check card and connections");
         _sdOk = false;
         return;
@@ -263,6 +288,7 @@ void listDir(const char *dirname, uint8_t levels) {
 // ═══════════════════════════════════════════════════════════════════════════════
 void write_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
     if (!_sdOk) return;
+    if (!SD_TAKE()) { Serial.println("[SD] Mutex timeout: write FACE.BIN"); return; }
     File32 f;
     if (!f.open(path, O_WRONLY | O_CREAT | O_TRUNC)) {
         Serial.println("[SD] write FACE.BIN failed");
@@ -285,6 +311,7 @@ void write_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
         Serial.printf("[SD] Saved %d face(s)\n", saved);
     }
     f.close();
+    SD_GIVE();
 }
 
 void read_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
@@ -292,11 +319,12 @@ void read_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
         Serial.println("[SD] No FACE.BIN found");
         return;
     }
+    if (!SD_TAKE()) { Serial.println("[SD] Mutex timeout: read FACE.BIN"); return; }
     File32 f;
-    if (!f.open(path, O_RDONLY)) return;
+    if (!f.open(path, O_RDONLY)) { SD_GIVE(); return; }
 
     uint8_t count = 0;
-    if (f.read(&count, 1) != 1 || count == 0) { f.close(); return; }
+    if (f.read(&count, 1) != 1 || count == 0) { f.close(); SD_GIVE(); return; }
 
     uint8_t confirmTimes = 0;
     f.read(&confirmTimes, 1);
@@ -317,6 +345,7 @@ void read_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
         l->count++;
     }
     f.close();
+    SD_GIVE();
     Serial.printf("[SD] Loaded %d face(s)\n", l->count);
 }
 
@@ -325,10 +354,12 @@ void read_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
 // ═══════════════════════════════════════════════════════════════════════════════
 String getUsersJSON() {
     if (!_sdOk) return "[]";
+    if (!SD_TAKE()) return "[]";
     File32 f;
-    if (!f.open("/db/users.txt", O_RDONLY)) return "[]";
+    if (!f.open("/db/users.txt", O_RDONLY)) { SD_GIVE(); return "[]"; }
     String s = sdReadAll(f);
     f.close();
+    SD_GIVE();
     return (s.length() > 0) ? s : "[]";
 }
 
@@ -348,6 +379,7 @@ int getUserCount() {
 // saveUserToDB – takes a UserRecord struct instead of four loose Strings.
 bool saveUserToDB(const UserRecord &user) {
     if (!_sdOk) return false;
+    if (!SD_TAKE()) return false;
 
     File32 f;
     DynamicJsonDocument doc(8192);
@@ -364,6 +396,7 @@ bool saveUserToDB(const UserRecord &user) {
     for (JsonObject u : arr)
         if (strcmp(u["name"] | "", user.name) == 0) {
             Serial.println("[DB] User already exists");
+            SD_GIVE();
             return false;
         }
 
@@ -375,9 +408,10 @@ bool saveUserToDB(const UserRecord &user) {
     nu["regDate"] = getCurrentDateStr();
     nu["faces"]   = 5;   // updated after enrolment completes
 
-    if (!f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) return false;
+    if (!f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) { SD_GIVE(); return false; }
     bool ok = serializeJson(doc, f) > 0;
     f.close();
+    SD_GIVE();
     Serial.printf("[DB] Saved user: %s  id: %s\n", user.name, user.id);
     return ok;
 }
@@ -385,39 +419,40 @@ bool saveUserToDB(const UserRecord &user) {
 // deleteUserFromDB – takes const char* name instead of String.
 bool deleteUserFromDB(const char *name) {
     if (!_sdOk) return false;
+    if (!SD_TAKE()) return false;
 
     File32 f;
-    if (!f.open("/db/users.txt", O_RDONLY)) return false;
+    if (!f.open("/db/users.txt", O_RDONLY)) { SD_GIVE(); return false; }
     DynamicJsonDocument doc(8192);
-    if (deserializeJson(doc, f) != DeserializationError::Ok) { f.close(); return false; }
+    if (deserializeJson(doc, f) != DeserializationError::Ok) { f.close(); SD_GIVE(); return false; }
     f.close();
 
     JsonArray arr = doc.as<JsonArray>();
     for (int i = 0; i < (int)arr.size(); i++) {
         if (strcmp(arr[i]["name"] | "", name) == 0) {
             arr.remove(i);
-            if (!f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) return false;
+            if (!f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) { SD_GIVE(); return false; }
             bool ok = serializeJson(doc, f) > 0;
             f.close();
+            SD_GIVE();
             return ok;
         }
     }
+    SD_GIVE();
     return false;
 }
 
 // getUserByName – looks up a user in /db/users.txt by their display name.
-// 'name' is what the face recognition library stores in FACE.BIN (id_name).
-// Fills 'out' with the full record: id, name, dept, role.
-// Returns true if found, false if not in DB (out is unchanged).
 bool getUserByName(const char *name, UserRecord &out) {
     if (!_sdOk) return false;
+    if (!SD_TAKE()) return false;
     File32 f;
-    if (!f.open("/db/users.txt", O_RDONLY)) return false;
+    if (!f.open("/db/users.txt", O_RDONLY)) { SD_GIVE(); return false; }
 
     DynamicJsonDocument doc(8192);
     DeserializationError err = deserializeJson(doc, f);
     f.close();
-    if (err != DeserializationError::Ok) return false;
+    if (err != DeserializationError::Ok) { SD_GIVE(); return false; }
 
     for (JsonObject u : doc.as<JsonArray>()) {
         if (strcmp(u["name"] | "", name) == 0) {
@@ -426,9 +461,11 @@ bool getUserByName(const char *name, UserRecord &out) {
             strncpy(out.name, u["name"] | name, sizeof(out.name) - 1);
             strncpy(out.dept, u["dept"] | "",   sizeof(out.dept) - 1);
             strncpy(out.role, u["role"] | "Student", sizeof(out.role) - 1);
+            SD_GIVE();
             return true;
         }
     }
+    SD_GIVE();
     return false;  // not found – caller should fall back to name-only
 }
 
@@ -437,6 +474,7 @@ bool getUserByName(const char *name, UserRecord &out) {
 // date / time / status are computed here from the current clock.
 void logAttendance(const AttendanceRecord &rec) {
     if (!_sdOk) return;
+    if (!SD_TAKE()) return;
 
     String date    = getCurrentDateStr();
     String timeStr = getCurrentHHMM();
@@ -475,14 +513,15 @@ void logAttendance(const AttendanceRecord &rec) {
              date.c_str(), timeStr.c_str(), status.c_str(), conf);
     f.print(line);
     f.close();
+    SD_GIVE();
     Serial.printf("[ATD] Logged: %s (%s) – %s – %s\n",
                   rec.name, rec.uid, timeStr.c_str(), status.c_str());
 }
 
 // manualAttendance – admin override.
-// rec.date / rec.time / rec.status are used as supplied (auto-filled if empty).
 bool manualAttendance(const AttendanceRecord &rec) {
     if (!_sdOk) return false;
+    if (!SD_TAKE()) return false;
 
     // Work with mutable copies so we can fill defaults
     char date[12]   = {0};
@@ -548,10 +587,11 @@ bool manualAttendance(const AttendanceRecord &rec) {
 
             if (replaced) {
                 File32 w;
-                if (!w.open(fname.c_str(), O_WRONLY | O_CREAT | O_TRUNC)) return false;
+                if (!w.open(fname.c_str(), O_WRONLY | O_CREAT | O_TRUNC)) { SD_GIVE(); return false; }
                 w.print(rebuilt);
                 w.close();
                 Serial.printf("[ATD] Manual override: %s -> %s\n", rec.uid, status);
+                SD_GIVE();
                 return true;
             }
         }
@@ -559,7 +599,7 @@ bool manualAttendance(const AttendanceRecord &rec) {
 
     // Append new record
     File32 f;
-    if (!f.open(fname.c_str(), O_WRONLY | O_CREAT | O_APPEND)) return false;
+    if (!f.open(fname.c_str(), O_WRONLY | O_CREAT | O_APPEND)) { SD_GIVE(); return false; }
     if (needHeader) f.println("UID,Name,Department,Date,Time,Status,Confidence");
 
     char lineBuf[256];
@@ -567,6 +607,7 @@ bool manualAttendance(const AttendanceRecord &rec) {
              rec.uid, name, date, timeStr, status);
     f.print(lineBuf);
     f.close();
+    SD_GIVE();
     return true;
 }
 
@@ -630,7 +671,10 @@ String getLogsJSON(String date, String dept, String status, String search) {
     String fname = "/atd/l_" + date + ".csv";
     DynamicJsonDocument doc(16384);
     JsonArray arr = doc.to<JsonArray>();
-    parseLogFile(fname, arr, dept, status, search);
+    if (SD_TAKE()) {
+        parseLogFile(fname, arr, dept, status, search);
+        SD_GIVE();
+    }
     String out;
     serializeJson(doc, out);
     return out;
@@ -648,9 +692,12 @@ String getLogsRange(int days) {
     JsonArray  absent  = root.createNestedArray("absent");
     JsonArray  late    = root.createNestedArray("late");
 
-    int total   = getUserCount();
+    int total   = getUserCount();   // getUserCount → getUsersJSON already takes mutex
     int sumPres = 0;
 
+    if (!SD_TAKE()) {
+        String out; serializeJson(doc, out); return out;
+    }
     for (int i = days-1; i >= 0; i--) {
         String dStr = dateStrDaysAgo(i);
         String lbl  = (days <= 14) ? dayLabel(i) : dStr.substring(5);
@@ -687,6 +734,7 @@ String getLogsRange(int days) {
         late.add(l);
         sumPres += p + l;
     }
+    SD_GIVE();
 
     root["total"]     = total;
     root["userCount"] = total;
@@ -700,21 +748,24 @@ String getLogsRange(int days) {
 String downloadAttendanceCSV(String date) {
     if (date == "") date = getCurrentDateStr();
     String fname = "/atd/l_" + date + ".csv";
-    if (!sd.exists(fname.c_str()))
-        return "UID,Name,Department,Date,Time,Status,Confidence\n";
+    if (!SD_TAKE()) return "UID,Name,Department,Date,Time,Status,Confidence\n";
+    if (!sd.exists(fname.c_str())) { SD_GIVE(); return "UID,Name,Department,Date,Time,Status,Confidence\n"; }
     File32 f;
-    if (!f.open(fname.c_str(), O_RDONLY))
-        return "UID,Name,Department,Date,Time,Status,Confidence\n";
+    if (!f.open(fname.c_str(), O_RDONLY)) { SD_GIVE(); return "UID,Name,Department,Date,Time,Status,Confidence\n"; }
     String c = sdReadAll(f);
     f.close();
+    SD_GIVE();
     return c;
 }
 
 bool clearAttendanceLogs(String date) {
     if (date == "") date = getCurrentDateStr();
     String fname = "/atd/l_" + date + ".csv";
-    if (!sd.exists(fname.c_str())) return true;
-    return sd.remove(fname.c_str());
+    if (!SD_TAKE()) return false;
+    if (!sd.exists(fname.c_str())) { SD_GIVE(); return true; }
+    bool ok = sd.remove(fname.c_str());
+    SD_GIVE();
+    return ok;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -725,6 +776,14 @@ String getStatsJSON() {
     String fname = "/atd/l_" + date + ".csv";
     int p=0, a=0, l=0;
 
+    if (!SD_TAKE()) {
+        // Return safe defaults if mutex unavailable
+        DynamicJsonDocument d(256);
+        d["total"]=0;d["present"]=0;d["absent"]=0;d["late"]=0;
+        d["storage"]="--";d["uptime"]="--";d["ntpSynced"]=ntpSynced;
+        d["date"]=date;d["time"]=getCurrentHHMM();
+        String s; serializeJson(d,s); return s;
+    }
     if (sd.exists(fname.c_str())) {
         File32 f;
         if (f.open(fname.c_str(), O_RDONLY)) {
@@ -779,23 +838,24 @@ String getStatsJSON() {
 
     String out;
     serializeJson(doc, out);
+    SD_GIVE();
     return out;
 }
 
 String getStorageJSON() {
     DynamicJsonDocument doc(256);
-    if (_sdOk) {
+    if (_sdOk && SD_TAKE()) {
         uint32_t bytesPerCluster = sd.vol()->bytesPerCluster();
         uint32_t totalClusters   = sd.vol()->clusterCount();
         uint32_t freeClusters    = sd.vol()->freeClusterCount();
         uint64_t totalBytes      = (uint64_t)totalClusters * bytesPerCluster;
         uint64_t freeBytes       = (uint64_t)freeClusters  * bytesPerCluster;
         uint64_t usedBytes       = totalBytes - freeBytes;
-
         doc["total"] = String((double)totalBytes / (1024.0*1024.0)) + " MB";
         doc["used"]  = String((double)usedBytes  / (1024.0*1024.0)) + " MB";
         doc["free"]  = String((double)freeBytes  / (1024.0*1024.0)) + " MB";
         doc["pct"]   = (totalBytes > 0) ? (int)((double)usedBytes / totalBytes * 100) : 0;
+        SD_GIVE();
     } else {
         doc["total"] = "--"; doc["used"] = "--"; doc["free"] = "--"; doc["pct"] = 0;
     }
@@ -823,6 +883,7 @@ String getStatusJSON() {
 // ═══════════════════════════════════════════════════════════════════════════════
 bool saveSettings(const AttendanceSettings &s) {
     if (!_sdOk) return false;
+    if (!SD_TAKE()) return false;
     DynamicJsonDocument doc(512);
     doc["startTime"]     = s.startTime;
     doc["endTime"]       = s.endTime;
@@ -835,21 +896,24 @@ bool saveSettings(const AttendanceSettings &s) {
     doc["ntpServer"]     = s.ntpServer;
 
     File32 f;
-    if (!f.open("/cfg/settings.json", O_WRONLY | O_CREAT | O_TRUNC)) return false;
+    if (!f.open("/cfg/settings.json", O_WRONLY | O_CREAT | O_TRUNC)) { SD_GIVE(); return false; }
     bool ok = serializeJson(doc, f) > 0;
     f.close();
+    SD_GIVE();
     Serial.println("[CFG] Settings saved");
     return ok;
 }
 
 bool loadSettings(AttendanceSettings &s) {
     setDefaultSettings(s);   // always start with defaults
-    if (!_sdOk || !sd.exists("/cfg/settings.json")) return false;
+    if (!_sdOk) return false;
+    if (!SD_TAKE()) return false;
+    if (!sd.exists("/cfg/settings.json")) { SD_GIVE(); return false; }
 
     File32 f;
-    if (!f.open("/cfg/settings.json", O_RDONLY)) return false;
+    if (!f.open("/cfg/settings.json", O_RDONLY)) { SD_GIVE(); return false; }
     DynamicJsonDocument doc(512);
-    if (deserializeJson(doc, f) != DeserializationError::Ok) { f.close(); return false; }
+    if (deserializeJson(doc, f) != DeserializationError::Ok) { f.close(); SD_GIVE(); return false; }
     f.close();
 
     if (doc.containsKey("startTime"))     strncpy(s.startTime,   doc["startTime"],  5);
@@ -861,6 +925,7 @@ bool loadSettings(AttendanceSettings &s) {
     if (doc.containsKey("autoMode"))      s.autoMode      = doc["autoMode"];
     if (doc.containsKey("gmtOffsetSec"))  s.gmtOffsetSec  = doc["gmtOffsetSec"];
     if (doc.containsKey("ntpServer"))     strncpy(s.ntpServer, doc["ntpServer"], 63);
+    SD_GIVE();
     Serial.println("[CFG] Settings loaded");
     return true;
 }

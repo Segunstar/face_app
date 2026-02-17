@@ -41,7 +41,7 @@ mtmn_config_t     mtmn_config       = {0};
 face_id_name_list id_list            = {0};
 int8_t            detection_enabled  = 0;
 int8_t            recognition_enabled = 0;
-int8_t            is_enrolling        = 0;
+volatile int8_t   is_enrolling        = 0;  // volatile: read by ATD/stream task, written by HTTP task
 
 // ─── Enrolment context (replaces three loose String globals) ─────────────────
 // Set by api_enroll_capture_handler; read by run_face_recognition.
@@ -59,7 +59,7 @@ httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
 
 #define ENROLL_CONFIRM_TIMES 5
-#define FACE_ID_SAVE_NUMBER  7
+#define FACE_ID_SAVE_NUMBER  20
 #define FACE_COLOR_WHITE  0x00FFFFFF
 #define FACE_COLOR_RED    0x000000FF
 #define FACE_COLOR_GREEN  0x0000FF00
@@ -420,7 +420,10 @@ static esp_err_t api_enroll_capture_handler(httpd_req_t *req) {
 
             httpd_query_key_value(buf, "dept", dept, sizeof(dept));
 
-            // Fill EnrollContext struct (replaces newUserId / newUserName / newUserDept)
+            // ── IMPORTANT: populate enrollCtx FULLY before setting is_enrolling ──
+            // The ATD/stream task checks is_enrolling and immediately reads
+            // enrollCtx.name.  Setting is_enrolling=1 first created a race
+            // where the first capture logged an empty name.
             strncpy(enrollCtx.id,   urlDecode(id).c_str(),   sizeof(enrollCtx.id)   - 1);
             strncpy(enrollCtx.name, urlDecode(name).c_str(), sizeof(enrollCtx.name) - 1);
             strncpy(enrollCtx.dept, urlDecode(dept).c_str(), sizeof(enrollCtx.dept) - 1);
@@ -430,6 +433,8 @@ static esp_err_t api_enroll_capture_handler(httpd_req_t *req) {
                                                enrollCtx.dept, "Student");
             Bridge::saveUserToDB(user);
 
+            // Set flag LAST – after context is fully written and DB saved.
+            // The volatile qualifier ensures the compiler doesn't reorder this.
             is_enrolling = 1;
             Serial.printf("[ENROLL] Capturing for '%s' (id=%s)\n",
                           enrollCtx.name, enrollCtx.id);

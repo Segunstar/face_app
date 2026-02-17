@@ -231,6 +231,7 @@ void initFaceRecognition() {
 // Pattern: green LED on solid + two short buzzer beeps.
 static void feedbackRecognised() {
     // Green LED stays on for the full duration so it dominates visually.
+    Serial.println("green led on");
     digitalWrite(GREEN_LED_GPIO, HIGH);
 
     // Beep 1
@@ -254,6 +255,7 @@ static void feedbackRecognised() {
 // Called when a face is detected but not in the enrolled database.
 // Pattern: red LED + long continuous buzz for 600 ms.
 static void feedbackNotRecognised() {
+    Serial.println("red led on");
     digitalWrite(RED_LED_GPIO,    HIGH);  // red LED on
     digitalWrite(BUZZER_GPIO_NUM, HIGH);  // buzzer on  (GPIO 1 – independent)
     vTaskDelay(pdMS_TO_TICKS(600));
