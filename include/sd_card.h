@@ -17,6 +17,11 @@ namespace Bridge {
     // ── SD initialisation (creates /db, /atd, /cfg, /db/users.txt if missing)
     void initSD();
 
+    // ── SD state query ────────────────────────────────────────────────────────
+    // Returns true if the SD card mounted successfully (or was remounted after
+    // a transient failure).  Check this before relying on any SD operation.
+    bool sdIsOk();
+
     // ── Directory helper ─────────────────────────────────────────────────────
     void listDir(const char *dirname, uint8_t levels);
 

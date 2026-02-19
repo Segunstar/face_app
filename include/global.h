@@ -10,6 +10,11 @@ extern bool isAttendanceMode;          // true = running face recognition loop
 extern unsigned long lastRecognitionTime;
 extern const unsigned long RECOGNITION_COOLDOWN;
 
+// ─── Enrollment ───────────────────────────────────────────────────────────────
+// Number of face-embedding frames accumulated per enrollment call.
+// Must match the value passed to face_id_name_init() in initFaceRecognition().
+#define ENROLL_CONFIRM_TIMES 5
+
 // ─── Face recognition objects (defined in app_httpd.cpp) ────────────────────
 extern mtmn_config_t mtmn_config;
 extern face_id_name_list id_list;

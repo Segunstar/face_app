@@ -91,13 +91,15 @@ static bool initCamera() {
     config.pin_sscb_scl  = SIOC_GPIO_NUM;
     config.pin_pwdn      = PWDN_GPIO_NUM;
     config.pin_reset     = RESET_GPIO_NUM;
+    // 20 MHz is the standard XCLK for OV2640; do NOT go above 20 MHz —
+    // the OV2640 PCLK becomes unstable and produces corrupt frames.
     config.xclk_freq_hz  = 20000000;
     config.pixel_format  = PIXFORMAT_JPEG;
 
     if (psramFound()) {
         config.frame_size   = FRAMESIZE_UXGA;
         config.jpeg_quality = 12;
-        config.fb_count     = 2;   // ← was 1; 2 prevents DMA starvation / JPG errors
+        config.fb_count     = 2;   // 2 buffers prevent DMA starvation / JPG corruption
     } else {
         config.frame_size   = FRAMESIZE_SVGA;
         config.jpeg_quality = 12;
@@ -111,44 +113,101 @@ static bool initCamera() {
     }
 
     sensor_t *s = esp_camera_sensor_get();
+
+    // ── OV3660-specific baseline ──────────────────────────────────────────────
     if (s->id.PID == OV3660_PID) {
         s->set_vflip(s, 1);
         s->set_brightness(s, 1);
         s->set_saturation(s, -2);
     }
-    s->set_framesize(s, FRAMESIZE_QVGA);  // required for face recognition
-    Serial.println("[CAM] Initialised OK");
+
+    // ── Low-light tuning (OV2640 – AI-Thinker default) ───────────────────────
+    // These settings are safe for all OV2640 revisions and improve indoor
+    // recognition significantly without degrading daytime performance.
+    //
+    // AGC (Automatic Gain Control) + ceiling
+    //   gain_ctrl=1 lets the sensor boost amplification in dim scenes.
+    //   agc_gain ceiling=6 (~8x) balances brightness vs noise.
+    //   Going above 6 (max 30) adds too much grain for MTMN detection.
+    s->set_gain_ctrl(s, 1);        // enable AGC
+    s->set_agc_gain(s, 6);         // AGC ceiling: 0=1x … 30=max; 6 ≈ 8x — indoor sweet spot
+
+    // AEC (Auto Exposure Control) — night mode
+    //   aec2=1 enables "night mode": the sensor extends integration time across
+    //   multiple frames, delivering brighter images in dim light with no extra noise.
+    //   ae_level=1 adds +1 stop of exposure bias on top of AEC target.
+    s->set_aec2(s, 1);             // enable AEC night mode
+    s->set_ae_level(s, 1);         // +1 exposure bias (range -2…+2)
+    s->set_aec_value(s, 400);      // initial AEC hint; AEC algorithm takes over from here
+
+    // Brightness / contrast
+    //   Slight brightness boost helps MTMN's P-net find face candidates.
+    //   Contrast +1 sharpens feature boundaries (eyes, nose, mouth) that
+    //   the landmark network relies on.
+    s->set_brightness(s, 1);       // -2…+2; 1 = mild boost
+    s->set_contrast(s, 1);         // -2…+2; 1 = mild sharpening
+
+    // Noise / correction
+    //   BPC (black pixel correction) and WPC (white pixel correction) remove
+    //   hot/dead pixels that confuse the neural net in low-signal conditions.
+    //   Raw gamma = slightly more shadow detail at the cost of a touch of highlight.
+    s->set_bpc(s, 1);
+    s->set_wpc(s, 1);
+    s->set_raw_gma(s, 1);          // raw gamma correction
+    s->set_lenc(s, 1);             // lens shading correction (edge brightness)
+
+    // ── Frame size for face recognition ──────────────────────────────────────
+    // QVGA (320×240) is the only resolution the ESP-WHO MTMN pipeline supports.
+    // Larger sizes are decimated internally but waste time; smaller sizes miss faces.
+    s->set_framesize(s, FRAMESIZE_QVGA);
+
+    Serial.println("[CAM] Initialised  (AGC, AEC-night, gamma, BPC/WPC active)");
     return true;
 }
 
 // ─── setup() ─────────────────────────────────────────────────────────────────
 void setup() {
-    esp_task_wdt_init(30, true);  // extend WDT to 30s – httpd SD handlers need headroom
+    // Extend WDT before anything else — SD multi-retry and WiFi can both take >5 s
+    esp_task_wdt_init(30, true);
     // WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector
+
     Serial.begin(115200);
     Serial.println("\n\n=== FaceGuard Pro v2.0 ===");
 
-    // 0) Feedback hardware – initialise before anything else so LEDs are
-    //    deterministically OFF from the first moment of power-on.
+    // 0) Hardware GPIO — all outputs LOW before anything else so LEDs don't
+    //    flicker randomly during SPI/camera init.
     pinMode(GREEN_LED_GPIO,  OUTPUT); digitalWrite(GREEN_LED_GPIO,  LOW);
     pinMode(RED_LED_GPIO,    OUTPUT); digitalWrite(RED_LED_GPIO,    LOW);
     pinMode(BUZZER_GPIO_NUM, OUTPUT); digitalWrite(BUZZER_GPIO_NUM, LOW);
-    // GPIO 12 = green LED, GPIO 13 = red LED, GPIO 1 = buzzer (TX pin)
-    // All three are now independent – red can no longer bleed into recognised feedback.
-    Serial.println("[HW]  LEDs + buzzer GPIO initialised");
+    Serial.println("[HW]  GPIOs initialised (LEDs + buzzer all OFF)");
 
-    // 1) SD card + settings
+    // 1) SD card — must succeed before proceeding.
+    //    initSD() retries up to 4 times with SPI bus reset between attempts.
+    //    If the card genuinely cannot be mounted (unseated, unformatted, dead)
+    //    the system halts here with a red LED blink so the problem is obvious.
     Bridge::initSD();
+    if (!Bridge::sdIsOk()) {
+        Serial.println("[FATAL] SD card unavailable after all retries.");
+        Serial.println("        Check: card seated? FAT32 formatted? Wiring correct?");
+        // Blink red LED forever – unmistakable hardware fault signal
+        while (true) {
+            digitalWrite(RED_LED_GPIO, HIGH); delay(200);
+            digitalWrite(RED_LED_GPIO, LOW);  delay(200);
+        }
+    }
     Bridge::loadSettings(gSettings);
     Bridge::listDir("/", 1);
 
-    // 2) Camera
+    // 2) Camera — also fatal if it fails (no point running attendance without it)
     if (!initCamera()) {
         Serial.println("[FATAL] Camera init failed – halting");
-        while (true) delay(1000);
+        while (true) {
+            digitalWrite(RED_LED_GPIO, HIGH); delay(500);
+            digitalWrite(RED_LED_GPIO, LOW);  delay(500);
+        }
     }
 
-    // 3) WiFi – plain DHCP, works on any network (hotspot, router, office)
+    // 3) WiFi — plain DHCP, works on any network (hotspot, router, office)
     strncpy(gSettings.ssid, ssid, sizeof(gSettings.ssid) - 1);
     WiFi.begin(ssid, password);
     Serial.print("[WiFi] Connecting");
@@ -159,8 +218,6 @@ void setup() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[WiFi] Connected – IP: %s\n",
                       WiFi.localIP().toString().c_str());
-
-        // Start mDNS so device is reachable at http://faceguard.local
         if (MDNS.begin(MDNS_NAME)) {
             MDNS.addService("http",   "tcp", 80);
             MDNS.addService("stream", "tcp", 81);
@@ -172,18 +229,19 @@ void setup() {
         Serial.println("\n[WiFi] Connection failed – running without network");
     }
 
-    // 4) Face recognition model init (local SD only – fast, no network)
+    // 4) Face recognition model — single init here; startCameraServer() does
+    //    NOT re-run mtmn_config so there is exactly one initialisation path.
     initFaceRecognition();
 
-    // 5) HTTP server – up immediately, zero network dependency
+    // 5) HTTP server
     startCameraServer();
 
-    // 6) Attendance task – pinned to CPU 0
+    // 6) Attendance task pinned to CPU 0 (HTTP + stream run on CPU 1)
     xTaskCreatePinnedToCore(
         attendanceTask, "atd", 8192, NULL, 1, NULL, 0
     );
 
-    // 7) NTP sync in a background task – never blocks setup()
+    // 7) NTP sync in a background task — never blocks setup()
     if (WiFi.status() == WL_CONNECTED) {
         xTaskCreate([](void*) {
             Bridge::syncNTP();
@@ -200,27 +258,37 @@ void setup() {
 }
 
 // ─── initFaceRecognition() ───────────────────────────────────────────────────
+// Single initialisation point for all MTMN parameters and the face ID list.
+// startCameraServer() uses these values — do NOT re-init them there.
 void initFaceRecognition() {
-    extern mtmn_config_t   mtmn_config;
-    extern face_id_name_list id_list;
-
+    // mtmn_config and id_list are defined in app_httpd.cpp (extern in global.h)
+    // so they are shared with the stream handler and enrolment code.
     mtmn_config.type                         = FAST;
     mtmn_config.min_face                     = 80;
     mtmn_config.pyramid                      = 0.707f;
     mtmn_config.pyramid_times                = 4;
-    mtmn_config.p_threshold.score            = 0.6f;
+
+    // P-net: face proposal network.
+    // Lowering score 0.6→0.55 catches more face candidates in low light at
+    // the cost of ~5% more false-positive boxes — O-net discards most of them.
+    mtmn_config.p_threshold.score            = 0.55f;   // was 0.6
     mtmn_config.p_threshold.nms              = 0.7f;
     mtmn_config.p_threshold.candidate_number = 20;
+
+    // R-net: refinement network — keep conservative, it runs fast.
     mtmn_config.r_threshold.score            = 0.7f;
     mtmn_config.r_threshold.nms              = 0.7f;
     mtmn_config.r_threshold.candidate_number = 10;
+
+    // O-net: output (landmark) network — keep strict to avoid false matches.
     mtmn_config.o_threshold.score            = 0.7f;
     mtmn_config.o_threshold.nms              = 0.7f;
     mtmn_config.o_threshold.candidate_number = 1;
 
-    face_id_name_init(&id_list, 7, 5);
+    face_id_name_init(&id_list, 10, ENROLL_CONFIRM_TIMES);
     Bridge::read_face_id_name_list_sdcard(&id_list, "/FACE.BIN");
-    Serial.printf("[FACE] Loaded %d enrolled face(s)\n", id_list.count);
+    Serial.printf("[FACE] Loaded %d enrolled face(s) | P-score=0.55 (low-light)\n",
+                  id_list.count);
 }
 
 // ─── Feedback helpers ─────────────────────────────────────────────────────────
@@ -265,56 +333,61 @@ static void feedbackNotRecognised() {
 
 // ─── attendanceTask() – FreeRTOS task pinned to CPU 0 ────────────────────────
 static void attendanceTask(void *pvParameters) {
-    extern mtmn_config_t   mtmn_config;
-    extern face_id_name_list id_list;
-
     Serial.println("[ATD] Task started on CPU 0");
 
+    // Brief startup delay: let camera settle its AEC/AGC after init before
+    // the first recognition attempt so the first frame isn't overexposed.
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
     while (true) {
-        // ── Gate checks ──────────────────────────────────────────────────────
+        esp_task_wdt_reset();  // feed WDT at the top of every iteration
+
+        // ── Gate: admin mode or auto-mode disabled ────────────────────────────
         if (!isAttendanceMode || !gSettings.autoMode) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
 
+        // ── Gate: enrollment in progress ─────────────────────────────────────
+        // While the stream handler is collecting confirmation frames for a new
+        // enrolment, attendanceTask must not compete for the camera framebuffer
+        // or call face_detect() concurrently.  This avoids DMA corruption and
+        // ensures the enrolment accumulator isn't confused by a parallel match.
+        if (is_enrolling == 1) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         unsigned long now = millis();
 
-        // ── Two independent cooldowns ─────────────────────────────────────────
-        // ATTEMPT_COOLDOWN  (500 ms): throttles how often face_detect() runs.
-        //   Fires on every attempt so the camera stays responsive – if a face
-        //   is missed due to a bad angle it retries half a second later.
-        //
-        // RECOGNITION_COOLDOWN (5000 ms): only armed after a *successful match*.
-        //   Prevents the same person being logged twice during one "session"
-        //   while still allowing quick retries for unrecognised faces.
-        if (now - lastAttemptTime < ATTEMPT_COOLDOWN) {
+        // ── Cooldown throttles ────────────────────────────────────────────────
+        if (now - lastAttemptTime    < (unsigned long)ATTEMPT_COOLDOWN) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-        if (now - lastRecognitionTime < RECOGNITION_COOLDOWN) {
+        if (now - lastRecognitionTime < (unsigned long)RECOGNITION_COOLDOWN) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-
-        // Stamp the attempt regardless of outcome (throttles CPU, stops spam)
         lastAttemptTime = now;
 
-        // ── Heap guard ───────────────────────────────────────────────────────
+        // ── Heap guard ────────────────────────────────────────────────────────
         if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < MIN_FREE_HEAP_BYTES) {
-            Serial.printf("[ATD] Low heap (%lu B) – skipping frame\n",
-                          (unsigned long)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+            Serial.printf("[ATD] Low heap (%u B) – skipping\n",
+                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
-        // ── Grab frame ───────────────────────────────────────────────────────
+        // ── Grab frame ────────────────────────────────────────────────────────
         camera_fb_t *fb = esp_camera_fb_get();
+
         if (!fb) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        // ── Convert to RGB888 ────────────────────────────────────────────────
+        // ── Convert to RGB888 ─────────────────────────────────────────────────
         dl_matrix3du_t *im = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
         if (!im) {
             esp_camera_fb_return(fb);
@@ -323,15 +396,16 @@ static void attendanceTask(void *pvParameters) {
         }
 
         bool converted = fmt2rgb888(fb->buf, fb->len, fb->format, im->item);
-        esp_camera_fb_return(fb);   // release buffer ASAP so stream can reuse it
+        esp_camera_fb_return(fb);
         fb = nullptr;
 
         if (!converted) {
             dl_matrix3du_free(im);
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        // ── Face detection ───────────────────────────────────────────────────
+        // ── Face detection ────────────────────────────────────────────────────
         box_array_t *boxes = face_detect(im, &mtmn_config);
 
         if (boxes) {
@@ -344,9 +418,6 @@ static void attendanceTask(void *pvParameters) {
                 if (match) {
                     Serial.printf("[ATD] Recognised: %s\n", match->id_name);
 
-                    // Look up full user record from users.txt by name.
-                    // match->id_name is only the display name stored in FACE.BIN.
-                    // getUserByName fills in the proper uid and dept.
                     UserRecord user;
                     bool found = Bridge::getUserByName(match->id_name, user);
 
@@ -356,13 +427,13 @@ static void attendanceTask(void *pvParameters) {
                         strncpy(rec.name, user.name, sizeof(rec.name) - 1);
                         strncpy(rec.dept, user.dept, sizeof(rec.dept) - 1);
                     } else {
-                        // Not in DB – use name as fallback for both uid and name
+                        // Not in DB – use the enrolled name as fallback
                         strncpy(rec.uid,  match->id_name, sizeof(rec.uid)  - 1);
                         strncpy(rec.name, match->id_name, sizeof(rec.name) - 1);
                     }
 
                     Bridge::logAttendance(rec);
-                    lastRecognitionTime = now;  // start 5s no-relog window
+                    lastRecognitionTime = now;
 
                     if (gSettings.buzzerEnabled) {
                         feedbackRecognised();
@@ -370,23 +441,22 @@ static void attendanceTask(void *pvParameters) {
                 } else {
                     Serial.println("[ATD] Face detected but not recognised");
                     if (gSettings.buzzerEnabled) {
-                        feedbackNotRecognised();  // red flash + long buzz
+                        feedbackNotRecognised();
                     }
                 }
                 dl_matrix3d_free(fid);
             }
 
             if (aligned) dl_matrix3du_free(aligned);
-            dl_lib_free(boxes->score);
-            dl_lib_free(boxes->box);
+            // Free all box sub-arrays defensively
+            if (boxes->score)    dl_lib_free(boxes->score);
+            if (boxes->box)      dl_lib_free(boxes->box);
             if (boxes->landmark) dl_lib_free(boxes->landmark);
             dl_lib_free(boxes);
         }
 
         dl_matrix3du_free(im);
-
-        // Yield to let the scheduler breathe between heavy inference cycles.
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(50));  // yield between inference cycles
     }
 }
 

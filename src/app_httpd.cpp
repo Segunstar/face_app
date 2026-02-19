@@ -42,6 +42,7 @@ face_id_name_list id_list            = {0};
 int8_t            detection_enabled  = 0;
 int8_t            recognition_enabled = 0;
 volatile int8_t   is_enrolling        = 0;  // volatile: read by ATD/stream task, written by HTTP task
+volatile int8_t   enroll_samples_left = 0;  // counts down ENROLL_CONFIRM_TIMES→0 as frames are captured
 
 // ─── Enrolment context (replaces three loose String globals) ─────────────────
 // Set by api_enroll_capture_handler; read by run_face_recognition.
@@ -58,7 +59,7 @@ static const char *_STREAM_PART =
 httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
 
-#define ENROLL_CONFIRM_TIMES 5
+// ENROLL_CONFIRM_TIMES defined in global.h
 #define FACE_ID_SAVE_NUMBER 10
 #define FACE_COLOR_WHITE  0x00FFFFFF
 #define FACE_COLOR_RED    0x000000FF
@@ -139,8 +140,10 @@ static int run_face_recognition(dl_matrix3du_t *im, box_array_t *net_boxes,
 
         if (is_enrolling == 1) {
             int8_t left = enroll_face_with_name(&id_list, face_id, cname);
+            enroll_samples_left = left;   // expose progress to status endpoint
             if (left == 0) {
-                is_enrolling = 0;
+                is_enrolling        = 0;
+                enroll_samples_left = 0;
                 Bridge::write_face_id_name_list_sdcard(&id_list, myFilePath);
                 Serial.printf("[ENROLL] Enrolled '%s' – saved to SD\n", cname);
             } else {
@@ -196,6 +199,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     while (true) {
+        esp_task_wdt_reset();   // stream can run for minutes; feed WDT each frame
         fb = esp_camera_fb_get();
         if (!fb) { res = ESP_FAIL; break; }
         gettimeofday(&ts, NULL);
@@ -418,6 +422,12 @@ static esp_err_t api_enroll_capture_handler(httpd_req_t *req) {
         if (httpd_query_key_value(buf, "id",   id,   sizeof(id))   == ESP_OK &&
             httpd_query_key_value(buf, "name", name, sizeof(name)) == ESP_OK) {
 
+            // Reject if a capture is still in progress (prevents double-trigger)
+            if (is_enrolling == 1) {
+                set_cors_headers(req);
+                return httpd_resp_send(req, "BUSY", HTTPD_RESP_USE_STRLEN);
+            }
+
             httpd_query_key_value(buf, "dept", dept, sizeof(dept));
 
             // ── IMPORTANT: populate enrollCtx FULLY before setting is_enrolling ──
@@ -433,16 +443,32 @@ static esp_err_t api_enroll_capture_handler(httpd_req_t *req) {
                                                enrollCtx.dept, "Student");
             Bridge::saveUserToDB(user);
 
-            // Set flag LAST – after context is fully written and DB saved.
+            // Initialise progress counter then set flag LAST.
             // The volatile qualifier ensures the compiler doesn't reorder this.
+            enroll_samples_left = ENROLL_CONFIRM_TIMES;
             is_enrolling = 1;
-            Serial.printf("[ENROLL] Capturing for '%s' (id=%s)\n",
-                          enrollCtx.name, enrollCtx.id);
+            Serial.printf("[ENROLL] Capturing for '%s' (id=%s, %d shots needed)\n",
+                          enrollCtx.name, enrollCtx.id, ENROLL_CONFIRM_TIMES);
             set_cors_headers(req);
-            return httpd_resp_send(req, "Capturing...", HTTPD_RESP_USE_STRLEN);
+            return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
         }
     }
     return httpd_resp_send_500(req);
+}
+
+// GET /api/enroll_status
+// Returns current enrollment progress so the browser can poll and show
+// a progress bar without requiring the user to click 5 times.
+// Response JSON: {"enrolling":0|1,"left":N,"total":N,"name":"..."}
+static esp_err_t api_enroll_status_handler(httpd_req_t *req) {
+    char j[192];
+    snprintf(j, sizeof(j),
+        "{\"enrolling\":%d,\"left\":%d,\"total\":%d,\"name\":\"%s\"}",
+        (int)is_enrolling,
+        (int)enroll_samples_left,
+        ENROLL_CONFIRM_TIMES,
+        enrollCtx.name);
+    return send_json(req, String(j));
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -596,28 +622,13 @@ static esp_err_t api_settings_post_handler(httpd_req_t *req) {
 //  startCameraServer()
 // ══════════════════════════════════════════════════════════════════════════════
 void startCameraServer() {
-    mtmn_config.type                         = FAST;
-    mtmn_config.min_face                     = 80;
-    mtmn_config.pyramid                      = 0.707f;
-    mtmn_config.pyramid_times                = 4;
-    mtmn_config.p_threshold.score            = 0.6f;
-    mtmn_config.p_threshold.nms              = 0.7f;
-    mtmn_config.p_threshold.candidate_number = 20;
-    mtmn_config.r_threshold.score            = 0.7f;
-    mtmn_config.r_threshold.nms              = 0.7f;
-    mtmn_config.r_threshold.candidate_number = 10;
-    mtmn_config.o_threshold.score            = 0.7f;
-    mtmn_config.o_threshold.nms              = 0.7f;
-    mtmn_config.o_threshold.candidate_number = 1;
-
-    face_id_name_init(&id_list, FACE_ID_SAVE_NUMBER, ENROLL_CONFIRM_TIMES);
-
-#if ENABLE_SD_TEST
-    Bridge::read_face_id_name_list_sdcard(&id_list, myFilePath);
-#endif
+    // ── NOTE: mtmn_config and id_list are initialised in initFaceRecognition()
+    //    (main.cpp) before this function is called.  Do NOT re-init them here —
+    //    double-init resets the face list that was just loaded from SD.
+    //    read_face_id_name_list_sdcard is called there too.
 
     httpd_config_t cfg  = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 24;
+    cfg.max_uri_handlers = 25;
     cfg.stack_size       = 8192;
 
     httpd_uri_t uris[] = {
@@ -635,6 +646,7 @@ void startCameraServer() {
         // Enrolment
         {"/api/enroll_mode",      HTTP_GET,  api_enroll_mode_handler,    NULL},
         {"/api/enroll_capture",   HTTP_GET,  api_enroll_capture_handler, NULL},
+        {"/api/enroll_status",    HTTP_GET,  api_enroll_status_handler,  NULL},
         // Attendance
         {"/api/logs",             HTTP_GET,  api_logs_handler,           NULL},
         {"/api/logs_range",       HTTP_GET,  api_logs_range_handler,     NULL},

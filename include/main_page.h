@@ -455,13 +455,21 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
         </div>
         <div class="cam-live" style="display:none" id="cam-live-lbl"><span style="width:6px;height:6px;background:var(--red);border-radius:50%;animation:blink 1s infinite"></span> LIVE</div>
       </div>
-      <div style="display:flex;gap:7px;margin-bottom:12px;flex-wrap:wrap">
+      <div style="display:flex;gap:7px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
         <button class="btn btn-g btn-sm" id="btn-start-cam" onclick="startCam()">&#x25B6; Start Camera</button>
-        <button class="btn btn-p btn-sm" id="btn-capture" onclick="triggerEnroll()" disabled>&#x1F4F8; Enroll Face (0/5)</button>
+        <button class="btn btn-p btn-sm" id="btn-capture" onclick="triggerEnroll()" disabled>&#x1F4F8; Enroll Face</button>
         <button class="btn btn-g btn-sm" id="btn-stop-cam" onclick="stopCam()" disabled>&#x25A0; Stop</button>
+        <span id="enroll-count-lbl" style="font-size:10px;font-family:monospace;color:var(--t3)"></span>
       </div>
-      <div class="cap-strip" id="cap-strip"></div>
-      <div class="info-box" style="margin-top:10px">Ensure good lighting. Capture 5+ images from slightly different angles. ESP32 will process each capture using MTMN face detection with <strong>5 confirmation shots per enrollment</strong>.</div>
+      <!-- Progress bar shown during active capture -->
+      <div id="enroll-progress-wrap" style="display:none;margin-bottom:10px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
+          <span style="font-size:10px;font-family:monospace;color:var(--cyan)" id="enroll-status-txt">Capturing…</span>
+          <span style="font-size:10px;font-family:monospace;color:var(--t2)" id="enroll-progress-pct">0%</span>
+        </div>
+        <div class="prog-bar"><div class="prog-fill c" id="enroll-progress-fill" style="width:0%"></div></div>
+      </div>
+      <div class="info-box" style="margin-top:10px">Ensure good lighting and face the camera squarely. Click <strong>Enroll Face</strong> once — the ESP32 automatically captures <strong>5 confirmation frames</strong> from the live stream. Repeat for different angles to improve recognition accuracy.</div>
     </div>
     <div class="md-footer">
       <button class="btn btn-g" onclick="closeMo('mo-user')">Cancel</button>
@@ -536,8 +544,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
 const H=location.origin;
 let allUsers=[];
 let delName='';
-let capCount=0;
+let enrollCount=0;      // how many full enrollments done this session
 let enrolling=false;
+let enrollPollTimer=null;
 let charts={};
 
 // ── Clock ──────────────────────────────────────────────────────────────────
@@ -578,9 +587,9 @@ function toast(msg,type='i'){
 function openMo(id){document.getElementById(id).classList.add('open');}
 function closeMo(id){
   document.getElementById(id).classList.remove('open');
-  if(id==='mo-user')stopCam();
+  if(id==='mo-user'){_stopEnrollPoll();stopCam();}
 }
-document.querySelectorAll('.mo').forEach(o=>o.addEventListener('click',e=>{if(e.target===o){o.classList.remove('open');stopCam();}}));
+document.querySelectorAll('.mo').forEach(o=>o.addEventListener('click',e=>{if(e.target===o){_stopEnrollPoll();o.classList.remove('open');stopCam();}}));
 
 // ── API helper ─────────────────────────────────────────────────────────────
 async function api(url,opts){
@@ -722,10 +731,8 @@ function openAddUser(){
   document.getElementById('mo-user-title').textContent='+ Register New User';
   document.getElementById('u-name').value='';
   document.getElementById('u-id').value='';
-  capCount=0;
-  document.getElementById('cap-strip').innerHTML='';
-  document.getElementById('btn-capture').textContent='📸 Enroll Face (0/5)';
-  document.getElementById('btn-capture').disabled=true;
+  enrollCount=0;
+  _updateEnrollCountLabel();
   openMo('mo-user');
 }
 
@@ -737,9 +744,8 @@ function openEditUser(name){
   document.getElementById('u-id').value=u.id||'';
   if(u.role)document.getElementById('u-role').value=u.role;
   if(u.dept)document.getElementById('u-dept').value=u.dept;
-  capCount=u.faces||0;
-  document.getElementById('cap-strip').innerHTML=Array.from({length:Math.min(capCount,8)},(_,i)=>`<div class="cap-th done"><span>&#x2713;</span></div>`).join('');
-  document.getElementById('btn-capture').textContent='&#x1F4F8; Enroll Face ('+capCount+'/5)';
+  enrollCount=u.faces||0;
+  _updateEnrollCountLabel();
   openMo('mo-user');
 }
 
@@ -747,7 +753,7 @@ async function saveUser(){
   const name=document.getElementById('u-name').value.trim();
   const id=document.getElementById('u-id').value.trim();
   if(!name||!id){toast('Name and ID are required','e');return;}
-  if(capCount<1&&!allUsers.find(u=>u.name===name)){toast('Please capture at least 1 face image','e');return;}
+  if(enrollCount<1&&!allUsers.find(u=>u.name===name)){toast('Please enroll at least one face image','e');return;}
   // DB save happens on enroll_capture – here we just close
   toast('User '+name+' saved','s');
   closeMo('mo-user');
@@ -766,8 +772,42 @@ async function confirmDelete(){
 }
 
 // ── Camera enrollment ──────────────────────────────────────────────────────
+
+function _updateEnrollCountLabel(){
+  const el=document.getElementById('enroll-count-lbl');
+  if(el)el.textContent=enrollCount>0?'✓ '+enrollCount+' enrollment'+(enrollCount>1?'s':'')+'  done':'';
+}
+
+function _stopEnrollPoll(){
+  if(enrollPollTimer){clearInterval(enrollPollTimer);enrollPollTimer=null;}
+}
+
+async function _pollEnrollStatus(total){
+  const r=await api('/api/enroll_status');
+  if(!r){_stopEnrollPoll();return;}
+  const d=await r.json();
+  const done=total-d.left;
+  const pct=Math.round((done/total)*100);
+  document.getElementById('enroll-progress-fill').style.width=pct+'%';
+  document.getElementById('enroll-progress-pct').textContent=pct+'%';
+  if(d.enrolling===0){
+    // Enrollment complete
+    _stopEnrollPoll();
+    enrollCount++;
+    document.getElementById('enroll-progress-wrap').style.display='none';
+    document.getElementById('enroll-status-txt').textContent='Capturing…';
+    document.getElementById('enroll-progress-fill').style.width='0%';
+    document.getElementById('enroll-progress-pct').textContent='0%';
+    document.getElementById('btn-capture').disabled=false;
+    document.getElementById('btn-capture').textContent='&#x1F4F8; Enroll Face';
+    _updateEnrollCountLabel();
+    toast('Face enrolled! Add more angles or click Save.','s');
+  } else {
+    document.getElementById('enroll-status-txt').textContent='Capturing frame '+done+' of '+total+'…';
+  }
+}
+
 async function startCam(){
-  // Tell ESP32 to enable detection on stream
   await api('/api/enroll_mode?active=1');
   const img=document.getElementById('cam-stream');
   img.src='http://'+location.hostname+':81/stream';
@@ -781,6 +821,7 @@ async function startCam(){
 }
 
 async function stopCam(){
+  _stopEnrollPoll();
   await api('/api/enroll_mode?active=0');
   const img=document.getElementById('cam-stream');
   img.src=''; img.style.display='none';
@@ -789,6 +830,8 @@ async function stopCam(){
   document.getElementById('btn-start-cam').disabled=false;
   document.getElementById('btn-stop-cam').disabled=true;
   document.getElementById('btn-capture').disabled=true;
+  document.getElementById('btn-capture').textContent='&#x1F4F8; Enroll Face';
+  document.getElementById('enroll-progress-wrap').style.display='none';
   enrolling=false;
 }
 
@@ -797,21 +840,34 @@ async function triggerEnroll(){
   const id=document.getElementById('u-id').value.trim();
   const dept=document.getElementById('u-dept').value;
   if(!name||!id){toast('Enter Name and ID first','e');return;}
+
+  // Disable button immediately to prevent double-trigger
   document.getElementById('btn-capture').disabled=true;
+  document.getElementById('btn-capture').textContent='&#x23F3; Capturing…';
+
   const r=await api('/api/enroll_capture?id='+encodeURIComponent(id)+'&name='+encodeURIComponent(name)+'&dept='+encodeURIComponent(dept));
-  if(r){
-    const msg=await r.text();
-    capCount++;
-    const strip=document.getElementById('cap-strip');
-    const div=document.createElement('div');
-    div.className='cap-th done';
-    div.innerHTML='<span style="font-size:18px">&#x2713;</span>';
-    strip.appendChild(div);
-    document.getElementById('btn-capture').textContent='&#x1F4F8; Enroll Face ('+capCount+'/5)';
+  if(!r){
+    // Network error – re-enable
     document.getElementById('btn-capture').disabled=false;
-    if(capCount>=5)toast('5 images captured! You can save now.','s');
-    else toast('Capture '+capCount+'/5 done','i');
+    document.getElementById('btn-capture').textContent='&#x1F4F8; Enroll Face';
+    return;
   }
+  const msg=await r.text();
+  if(msg==='BUSY'){
+    toast('Capture still in progress, please wait…','w');
+    document.getElementById('btn-capture').disabled=false;
+    document.getElementById('btn-capture').textContent='&#x1F4F8; Enroll Face';
+    return;
+  }
+
+  // Show progress bar and start polling
+  const total=5; // matches ENROLL_CONFIRM_TIMES on firmware
+  document.getElementById('enroll-progress-wrap').style.display='block';
+  document.getElementById('enroll-progress-fill').style.width='0%';
+  document.getElementById('enroll-status-txt').textContent='Waiting for face detection…';
+  toast('Enrollment started — hold still','i');
+  _stopEnrollPoll();
+  enrollPollTimer=setInterval(()=>_pollEnrollStatus(total),400);
 }
 
 // ── Train model ────────────────────────────────────────────────────────────

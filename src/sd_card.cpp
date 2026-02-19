@@ -180,8 +180,72 @@ static String computeStatus(const char *hhmm) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  SD Initialisation
+//  SD Initialisation  –  with retry + bus-reset recovery
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// Internal: attempt a single SD mount.
+// Uses SHARED_SPI (not DEDICATED_SPI): DEDICATED_SPI holds the Arduino SPI
+// mutex permanently, causing FreeRTOS asserts when other tasks call
+// endTransaction from a different task context.
+// clkMHz: start slow (10 MHz) for the first attempt to handle sluggish cards,
+// then ramp to 20 MHz on subsequent attempts.
+static bool _sdTryMount(uint8_t clkMHz) {
+    // Re-init SPI bus to clear any lingering state from a failed previous attempt
+    SPI.end();
+    delay(20);
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    // Pull CS high for at least 74 clock cycles before SD init (SD spec §6.4.1)
+    pinMode(SD_CS, OUTPUT);
+    digitalWrite(SD_CS, HIGH);
+    delay(10);
+    return sd.begin(SdSpiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(clkMHz), &SPI));
+}
+
+// Internal: create required directory tree and bootstrap empty user DB.
+static void _sdBootstrapFS() {
+    const char *dirs[] = { "/db", "/atd", "/cfg", nullptr };
+    for (int i = 0; dirs[i]; i++) {
+        if (!sd.exists(dirs[i])) {
+            sd.mkdir(dirs[i]);
+            Serial.printf("[SD] Created dir %s\n", dirs[i]);
+        }
+    }
+    if (!sd.exists("/db/users.txt")) {
+        File32 f;
+        if (f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) {
+            f.print("[]");
+            f.close();
+            Serial.println("[SD] Created /db/users.txt");
+        }
+    }
+}
+
+// Public: (re)mount the SD card.  Called from initSD() and from sdReinit()
+// when a runtime operation fails.  Returns true on success.
+// Retries up to SD_MOUNT_RETRIES times with an exponential-ish back-off and
+// a deliberate SPI bus reset between each attempt.
+#define SD_MOUNT_RETRIES 4
+static bool _sdMount() {
+    // Clock speeds to try (MHz): slow first to handle lazy cards, then faster
+    const uint8_t clks[] = { 10, 10, 20, 20 };
+    const uint32_t delays_ms[] = { 0, 500, 1000, 2000 };
+
+    for (int attempt = 0; attempt < SD_MOUNT_RETRIES; attempt++) {
+        if (attempt > 0) {
+            Serial.printf("[SD] Retry %d/%d after %lu ms…\n",
+                          attempt, SD_MOUNT_RETRIES - 1, (unsigned long)delays_ms[attempt]);
+            delay(delays_ms[attempt]);
+        }
+        if (_sdTryMount(clks[attempt])) {
+            Serial.printf("[SD] Mounted OK on attempt %d (clk=%d MHz)\n",
+                          attempt + 1, clks[attempt]);
+            return true;
+        }
+        Serial.printf("[SD] Attempt %d failed\n", attempt + 1);
+    }
+    return false;
+}
+
 void initSD() {
     // Create the cross-task SD mutex BEFORE any SD operation.
     // Recursive so helpers that call other helpers don't self-deadlock.
@@ -190,38 +254,32 @@ void initSD() {
         configASSERT(_sdMutex);
     }
 
-    // SHARED_SPI (not DEDICATED_SPI): DEDICATED_SPI takes the Arduino SPI mutex
-    // once in begin() and never releases it, causing the FreeRTOS
-    // "xQueueGenericSend queue.c:832" assert when the ATD task or httpd task
-    // later calls endTransaction() from a different task context.
-    // SHARED_SPI calls beginTransaction/endTransaction around every command,
-    // keeping take/give in the same task.
-    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    if (!sd.begin(SdSpiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(20), &SPI))) {
-        Serial.println("[SD] Mount failed – check card and connections");
+    if (!_sdMount()) {
+        Serial.println("[SD] *** Mount failed after all retries – SD features disabled ***");
+        Serial.println("[SD]     Check: card seated? FAT32 formatted? SPI wiring (CS=33)?");
         _sdOk = false;
         return;
     }
+
     _sdOk = true;
+    _sdBootstrapFS();
+    Serial.println("[SD] Ready  (LFN, retry-init, runtime remount enabled)");
+}
 
-    // Create required directories (sd.mkdir does nothing if already present)
-    const char *dirs[] = { "/db", "/atd", "/cfg", nullptr };
-    for (int i = 0; dirs[i]; i++) {
-        if (!sd.exists(dirs[i])) {
-            sd.mkdir(dirs[i]);
-            Serial.printf("[SD] Created %s\n", dirs[i]);
-        }
+// sdReinit – called internally when a runtime SD operation fails unexpectedly.
+// Attempts a silent remount without disturbing the mutex.
+// Returns true if the card came back online.
+static bool sdReinit() {
+    Serial.println("[SD] Attempting runtime remount…");
+    if (_sdMount()) {
+        _sdOk = true;
+        _sdBootstrapFS();
+        Serial.println("[SD] Runtime remount succeeded");
+        return true;
     }
-
-    // Bootstrap empty user DB
-    if (!sd.exists("/db/users.txt")) {
-        File32 f;
-        if (f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) {
-            f.print("[]");
-            f.close();
-        }
-    }
-    Serial.println("[SD] Ready  (LFN enabled via SdFat)");
+    _sdOk = false;
+    Serial.println("[SD] Runtime remount failed – SD offline");
+    return false;
 }
 
 // ─── SD state ────────────────────────────────────────────────────────────────
@@ -287,12 +345,18 @@ void listDir(const char *dirname, uint8_t levels) {
 //  Face-ID binary persistence
 // ═══════════════════════════════════════════════════════════════════════════════
 void write_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
-    if (!_sdOk) return;
+    if (!_sdOk) { if (!sdReinit()) return; }
     if (!SD_TAKE()) { Serial.println("[SD] Mutex timeout: write FACE.BIN"); return; }
     File32 f;
     if (!f.open(path, O_WRONLY | O_CREAT | O_TRUNC)) {
-        Serial.println("[SD] write FACE.BIN failed");
-        return;
+        Serial.println("[SD] write FACE.BIN open failed – attempting remount");
+        SD_GIVE();
+        if (sdReinit() && SD_TAKE()) {
+            if (!f.open(path, O_WRONLY | O_CREAT | O_TRUNC)) {
+                Serial.println("[SD] write FACE.BIN failed after remount");
+                SD_GIVE(); return;
+            }
+        } else return;
     }
 
     f.write((uint8_t)l->count);
@@ -501,8 +565,15 @@ void logAttendance(const AttendanceRecord &rec) {
     bool needHeader = !sd.exists(fname.c_str());
     File32 f;
     if (!f.open(fname.c_str(), O_WRONLY | O_CREAT | O_APPEND)) {
-        Serial.println("[ATD] Failed to open log file");
-        return;
+        Serial.println("[ATD] Log open failed – attempting SD remount");
+        SD_GIVE();
+        if (!sdReinit()) return;
+        if (!SD_TAKE()) return;
+        needHeader = !sd.exists(fname.c_str());
+        if (!f.open(fname.c_str(), O_WRONLY | O_CREAT | O_APPEND)) {
+            Serial.println("[ATD] Log open failed after remount – dropping record");
+            SD_GIVE(); return;
+        }
     }
     if (needHeader) f.println("UID,Name,Department,Date,Time,Status,Confidence");
 
