@@ -691,14 +691,30 @@ function loadDeptBars(stats){
 // ══════════════════════════════════════════════════════════════════════════════
 //  USERS
 // ══════════════════════════════════════════════════════════════════════════════
-async function loadUsers(){
+
+// loadUsers with automatic retry.
+// The SD mutex can be contended right after login (dashboard fires several
+// concurrent requests), causing getUsersJSON() to return [] silently.
+// We retry up to `retries` times with a short delay so the list always loads.
+async function loadUsers(retries=3){
   const r=await api('/api/users');
-  if(!r)return;
-  allUsers=await r.json();
+  if(!r){
+    if(retries>0){await new Promise(ok=>setTimeout(ok,1000));return loadUsers(retries-1);}
+    toast('Could not load users – check device connection','e');
+    return;
+  }
+  let users=[];
+  try{users=await r.json();}catch(e){users=[];}
+  // If we got an empty list but previously had users, it's likely an SD
+  // contention issue – retry before trusting the empty result.
+  if(users.length===0 && retries>0 && allUsers.length>0){
+    await new Promise(ok=>setTimeout(ok,900));
+    return loadUsers(retries-1);
+  }
+  allUsers=users;
   renderUsers(allUsers);
-  // Update model status
   document.getElementById('model-dot').className='dot '+(allUsers.length>0?'g':'r');
-  document.getElementById('model-txt').textContent=allUsers.length>0?`${allUsers.length} faces loaded`:'No faces enrolled';
+  document.getElementById('model-txt').textContent=allUsers.length>0?`${allUsers.length} face${allUsers.length>1?'s':''} loaded`:'No faces enrolled';
 }
 
 function renderUsers(list){
@@ -791,7 +807,7 @@ async function _pollEnrollStatus(total){
   document.getElementById('enroll-progress-fill').style.width=pct+'%';
   document.getElementById('enroll-progress-pct').textContent=pct+'%';
   if(d.enrolling===0){
-    // Enrollment complete
+    // Enrollment complete – reset UI
     _stopEnrollPoll();
     enrollCount++;
     document.getElementById('enroll-progress-wrap').style.display='none';
@@ -802,6 +818,9 @@ async function _pollEnrollStatus(total){
     document.getElementById('btn-capture').textContent='&#x1F4F8; Enroll Face';
     _updateEnrollCountLabel();
     toast('Face enrolled! Add more angles or click Save.','s');
+    // Immediately refresh the user grid so the new user appears in the list
+    // without the admin having to close the modal first.
+    loadUsers();
   } else {
     document.getElementById('enroll-status-txt').textContent='Capturing frame '+done+' of '+total+'…';
   }
@@ -1064,9 +1083,13 @@ window.addEventListener('DOMContentLoaded',()=>{
   const today=new Date().toISOString().slice(0,10);
   if(document.getElementById('att-date'))document.getElementById('att-date').value=today;
   if(document.getElementById('man-date'))document.getElementById('man-date').value=today;
+  // Stagger initial loads: dashboard fires several sub-requests (/api/stats,
+  // /api/logs_range, /api/logs) that all hit the SD card simultaneously.
+  // Loading users 600 ms later lets the dashboard requests clear the SD mutex
+  // first, preventing the silent [] response that caused "users blank" on login.
   loadDashboard();
-  loadUsers();
-  // Auto-refresh stats every 30 seconds
+  setTimeout(()=>loadUsers(), 600);
+  // Auto-refresh
   setInterval(()=>{if(document.getElementById('sec-dashboard').classList.contains('active'))loadDashboard();},30000);
   setInterval(()=>{if(document.getElementById('sec-attendance').classList.contains('active'))loadAttendance();},15000);
 });

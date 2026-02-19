@@ -212,8 +212,12 @@ static esp_err_t stream_handler(httpd_req_t *req) {
             } else { jpg_len = fb->len; jpg_buf = fb->buf; }
         } else {
             image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
-            if (!image_matrix) { res = ESP_FAIL; }
-            else {
+            if (!image_matrix) {
+                // Must return the framebuffer before marking failure —
+                // previously fb was leaked here when alloc failed.
+                esp_camera_fb_return(fb); fb = NULL;
+                res = ESP_FAIL;
+            } else {
                 if (!fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item)) {
                     res = ESP_FAIL;
                 } else {
@@ -221,11 +225,11 @@ static esp_err_t stream_handler(httpd_req_t *req) {
                     if (boxes) {
                         int fid = 0;
                         if (recognition_enabled)
-                            // Pass enrollCtx.name into the recognition runner
                             fid = run_face_recognition(image_matrix, boxes,
                                                        enrollCtx.name);
                         draw_face_boxes(image_matrix, boxes, fid);
-                        dl_lib_free(boxes->score); dl_lib_free(boxes->box);
+                        if (boxes->score)    dl_lib_free(boxes->score);
+                        if (boxes->box)      dl_lib_free(boxes->box);
                         if (boxes->landmark) dl_lib_free(boxes->landmark);
                         dl_lib_free(boxes);
                     }
@@ -250,12 +254,26 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         if (res == ESP_OK)
             res = httpd_resp_send_chunk(req, (const char*)jpg_buf, jpg_len);
 
-        if (fb) esp_camera_fb_return(fb);
+        if (fb)      esp_camera_fb_return(fb);
         else if (jpg_buf) free(jpg_buf);
-        jpg_buf = NULL;
+        jpg_buf = NULL; fb = NULL;
 
         if (res != ESP_OK) break;
     }
+
+    // ── Client disconnected (ECONNRESET / browser tab closed) ─────────────────
+    // If the browser closed the tab or navigated away during enrollment, the
+    // enroll_mode?active=0 cleanup call never runs.  Reset state here so the
+    // system isn't permanently stuck in enroll mode until reboot.
+    if (is_enrolling || detection_enabled || recognition_enabled) {
+        is_enrolling        = 0;
+        enroll_samples_left = 0;
+        detection_enabled   = 0;
+        recognition_enabled = 0;
+        memset(&enrollCtx, 0, sizeof(enrollCtx));
+        Serial.println("[STREAM] Client disconnected – enroll state auto-reset");
+    }
+
     return res;
 }
 
@@ -319,6 +337,9 @@ static void set_cors_headers(httpd_req_t *req) {
 
 static esp_err_t send_json(httpd_req_t *req, const String &json) {
     set_cors_headers(req);
+    // Prevent browsers from caching API responses — stale cached [] caused
+    // the "users blank after attendance mode" symptom.
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, json.c_str(), (ssize_t)json.length());
 }
@@ -627,9 +648,22 @@ void startCameraServer() {
     //    double-init resets the face list that was just loaded from SD.
     //    read_face_id_name_list_sdcard is called there too.
 
+    // Suppress "httpd_sock_err: error in recv : 104" (ECONNRESET) warnings —
+    // these fire every time a browser closes a tab or aborts a fetch, which is
+    // completely normal.  Raising the level to ERROR hides the noise while
+    // still surfacing genuine errors.
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_sess", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_uri",  ESP_LOG_ERROR);
+
     httpd_config_t cfg  = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 25;
-    cfg.stack_size       = 8192;
+    cfg.max_uri_handlers  = 25;
+    cfg.stack_size        = 8192;
+    // Shorter socket timeouts: prevent a stalled client from holding a httpd
+    // worker thread for the full default 60-second period, which blocks other
+    // concurrent requests (e.g. /api/users loading after /api/stats stalls).
+    cfg.recv_wait_timeout = 8;   // seconds; default is 5 — raised slightly for slow WiFi
+    cfg.send_wait_timeout = 8;
 
     httpd_uri_t uris[] = {
         {"/",                     HTTP_GET,  index_handler,              NULL},
