@@ -59,7 +59,7 @@ httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
 
 #define ENROLL_CONFIRM_TIMES 5
-#define FACE_ID_SAVE_NUMBER  20
+#define FACE_ID_SAVE_NUMBER 10
 #define FACE_COLOR_WHITE  0x00FFFFFF
 #define FACE_COLOR_RED    0x000000FF
 #define FACE_COLOR_GREEN  0x0000FF00
