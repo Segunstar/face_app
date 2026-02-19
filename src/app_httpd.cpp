@@ -589,6 +589,51 @@ static esp_err_t api_clear_logs_handler(httpd_req_t *req) {
     return httpd_resp_send(req, ok ? "OK" : "FAIL", HTTPD_RESP_USE_STRLEN);
 }
 
+// POST /api/factory_reset
+// Wipes all SD data and clears the in-memory face list.
+// The device stays online — no reboot required.  A full re-enrolment is
+// needed before face recognition will work again.
+static esp_err_t api_factory_reset_handler(httpd_req_t *req) {
+    Serial.println("[RESET] Factory reset requested via portal");
+
+    // 1. Wipe SD (logs, FACE.BIN, users.txt, settings.json)
+    bool ok = Bridge::factoryReset();
+    if (!ok) {
+        Serial.println("[RESET] SD wipe failed");
+        set_cors_headers(req);
+        return httpd_resp_send(req, "FAIL: SD wipe error", HTTPD_RESP_USE_STRLEN);
+    }
+
+    // 2. Clear in-memory face list so recognition stops immediately
+    //    (no stale faces matched against a now-empty database)
+    if (id_list.head) {
+        face_id_node *p = id_list.head;
+        while (p) {
+            face_id_node *next = p->next;
+            if (p->id_vec) dl_matrix3d_free(p->id_vec);
+            dl_lib_free(p);
+            p = next;
+        }
+    }
+    id_list.head    = nullptr;
+    id_list.tail    = nullptr;
+    id_list.count   = 0;
+
+    // 3. Reset all enrol/detection flags in case they were active
+    is_enrolling        = 0;
+    enroll_samples_left = 0;
+    detection_enabled   = 0;
+    recognition_enabled = 0;
+    memset(&enrollCtx, 0, sizeof(enrollCtx));
+
+    // 4. Reload default settings into gSettings
+    setDefaultSettings(gSettings);
+
+    Serial.println("[RESET] Done. Device ready for fresh enrolment.");
+    set_cors_headers(req);
+    return httpd_resp_send(req, "OK", 2);
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  SETTINGS API
 // ══════════════════════════════════════════════════════════════════════════════
@@ -657,7 +702,7 @@ void startCameraServer() {
     esp_log_level_set("httpd_uri",  ESP_LOG_ERROR);
 
     httpd_config_t cfg  = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers  = 25;
+    cfg.max_uri_handlers  = 26;  // bumped from 25 to accommodate /api/factory_reset
     cfg.stack_size        = 8192;
     // Shorter socket timeouts: prevent a stalled client from holding a httpd
     // worker thread for the full default 60-second period, which blocks other
@@ -690,6 +735,8 @@ void startCameraServer() {
         // Settings
         {"/api/settings",         HTTP_GET,  api_settings_get_handler,   NULL},
         {"/api/settings",         HTTP_POST, api_settings_post_handler,  NULL},
+        // Factory reset
+        {"/api/factory_reset",    HTTP_POST, api_factory_reset_handler,  NULL},
     };
 
     if (httpd_start(&camera_httpd, &cfg) == ESP_OK) {

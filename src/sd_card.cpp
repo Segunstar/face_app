@@ -838,6 +838,73 @@ bool clearAttendanceLogs(String date) {
     SD_GIVE();
     return ok;
 }
+// ─── factoryReset ─────────────────────────────────────────────────────────────
+// Wipes the SD card to a completely clean slate:
+//   * Deletes every file inside /atd/   (all attendance CSV logs)
+//   * Deletes /FACE.BIN                 (all face embeddings)
+//   * Resets /db/users.txt to []        (empty user database)
+//   * Deletes /cfg/settings.json        (settings revert to firmware defaults)
+// Directory structure (/atd, /db, /cfg) is recreated immediately after.
+// Returns true on success. The caller must also clear the in-memory id_list.
+bool factoryReset() {
+    if (!_sdOk) return false;
+    if (!SD_TAKE()) { Serial.println("[RESET] Mutex timeout"); return false; }
+
+    Serial.println("[RESET] Factory reset started...");
+
+    // 1. Delete all attendance CSV files
+    if (sd.exists("/atd")) {
+        File32 dir, entry;
+        if (dir.open("/atd", O_RDONLY)) {
+            while (entry.openNext(&dir, O_RDONLY)) {
+                char fname[64] = {0};
+                entry.getName(fname, sizeof(fname));
+                bool isDir = entry.isDirectory();
+                entry.close();
+                if (!isDir) {
+                    String path = "/atd/" + String(fname);
+                    sd.remove(path.c_str());
+                    Serial.printf("[RESET] Removed %s\n", path.c_str());
+                }
+            }
+            dir.close();
+        }
+    }
+
+    // 2. Delete face embeddings
+    if (sd.exists("/FACE.BIN")) {
+        sd.remove("/FACE.BIN");
+        Serial.println("[RESET] Removed /FACE.BIN");
+    }
+
+    // 3. Reset user database to empty array
+    {
+        File32 f;
+        if (f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) {
+            f.print("[]");
+            f.close();
+            Serial.println("[RESET] Reset /db/users.txt to []");
+        } else {
+            Serial.println("[RESET] WARNING: Could not reset /db/users.txt");
+        }
+    }
+
+    // 4. Delete settings (device reverts to firmware defaults on reload)
+    if (sd.exists("/cfg/settings.json")) {
+        sd.remove("/cfg/settings.json");
+        Serial.println("[RESET] Removed /cfg/settings.json");
+    }
+
+    SD_GIVE();
+
+    // Recreate the directory skeleton
+    _sdBootstrapFS();
+
+    Serial.println("[RESET] Factory reset complete -- clean slate");
+    return true;
+}
+
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Dashboard stats

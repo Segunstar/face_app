@@ -429,6 +429,17 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
         </div>
         <div class="info-box" style="margin-top:10px">All attendance logs are stored on the SD card in <strong>/atd/log_YYYY-MM-DD.csv</strong>.<br>Face encodings are saved as <strong>/FACE.BIN</strong>.<br>User database: <strong>/db/users.txt</strong>. Settings: <strong>/cfg/settings.json</strong>.</div>
       </div>
+      <!-- ── Danger Zone ─────────────────────────────────────────────────── -->
+      <div class="sg" style="border:1px solid rgba(255,61,87,.35);margin-top:12px">
+        <div class="sg-title" style="color:var(--red)">&#x26A0; Danger Zone — Factory Reset</div>
+        <p style="font-size:11px;color:var(--t2);line-height:1.7;margin:0 0 10px">
+          Erases <strong style="color:var(--t1)">all attendance logs, all enrolled faces, the user database, and saved settings</strong> from the SD card. The device stays online and returns to a clean slate immediately — no reboot required.<br>
+          <strong style="color:var(--red)">This cannot be undone.</strong> Download your CSV logs first if you need them.
+        </p>
+        <button class="btn btn-d" onclick="openMo('mo-factory-reset')" style="width:100%;font-weight:700;letter-spacing:.5px">
+          &#x1F9F9; Factory Reset — Wipe All Data
+        </button>
+      </div>
     </div>
   </div>
 
@@ -513,6 +524,34 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
     <div class="md-footer">
       <button class="btn btn-g" onclick="closeMo('mo-del')">Cancel</button>
       <button class="btn btn-d" onclick="confirmDelete()">Delete Permanently</button>
+    </div>
+  </div>
+</div>
+
+<!-- Factory Reset Confirmation Modal -->
+<div class="mo" id="mo-factory-reset">
+  <div class="md" style="max-width:420px">
+    <div class="md-hdr">
+      <div class="md-title" style="color:var(--red)">&#x26A0; Factory Reset</div>
+      <button class="md-close" onclick="closeMo('mo-factory-reset')">&#x2715;</button>
+    </div>
+    <div class="md-body" style="text-align:center;padding:24px 20px 16px">
+      <div style="font-size:48px;margin-bottom:10px">&#x1F9F9;</div>
+      <div style="font-size:13px;color:var(--t1);font-weight:600;margin-bottom:10px">This will permanently erase:</div>
+      <div style="font-size:11px;color:var(--t2);font-family:monospace;line-height:2;text-align:left;background:rgba(255,61,87,.07);border:1px solid rgba(255,61,87,.2);border-radius:6px;padding:10px 14px;margin-bottom:14px">
+        &#x2715; All attendance logs (/atd/*.csv)<br>
+        &#x2715; All enrolled face data (/FACE.BIN)<br>
+        &#x2715; Entire user database (/db/users.txt)<br>
+        &#x2715; Saved settings (/cfg/settings.json)
+      </div>
+      <div style="font-size:11px;color:var(--t2);margin-bottom:14px">Type <strong style="color:var(--red);font-family:monospace;letter-spacing:1px">RESET</strong> to confirm:</div>
+      <input type="text" id="reset-confirm-input" placeholder="Type RESET here"
+        style="width:100%;box-sizing:border-box;text-align:center;font-size:14px;font-family:monospace;letter-spacing:2px;border:1px solid rgba(255,61,87,.4);background:rgba(255,61,87,.06);color:var(--t1)"
+        oninput="document.getElementById('btn-factory-reset-confirm').disabled=(this.value!=='RESET')">
+    </div>
+    <div class="md-footer">
+      <button class="btn btn-g" onclick="closeMo('mo-factory-reset');document.getElementById('reset-confirm-input').value='';document.getElementById('btn-factory-reset-confirm').disabled=true">Cancel</button>
+      <button class="btn btn-d" id="btn-factory-reset-confirm" disabled onclick="confirmFactoryReset()" style="font-weight:700">&#x1F9F9; Wipe Everything</button>
     </div>
   </div>
 </div>
@@ -962,6 +1001,37 @@ async function clearLogs(){
   const date=document.getElementById('att-date')?.value||'';
   const r=await api('/api/clear_logs?date='+date);
   if(r){toast('Logs cleared','w');loadAttendance();}
+}
+
+async function confirmFactoryReset(){
+  // Disable the button immediately to prevent double-submit
+  const btn=document.getElementById('btn-factory-reset-confirm');
+  btn.disabled=true;
+  btn.textContent='Wiping…';
+
+  const r=await api('/api/factory_reset',{method:'POST'});
+
+  // Reset modal input state regardless of outcome
+  document.getElementById('reset-confirm-input').value='';
+  closeMo('mo-factory-reset');
+
+  if(!r){
+    toast('Factory reset failed – network error','e');
+    return;
+  }
+  const t=await r.text();
+  if(t==='OK'){
+    // Refresh portal to reflect empty state
+    allUsers=[];
+    renderUsers([]);
+    toast('Factory reset complete. All data wiped. Re-enrol users to begin.','w');
+    // Reload dashboard and users after a short delay to let SD settle
+    setTimeout(()=>{loadDashboard();loadUsers();},1200);
+  } else {
+    toast('Factory reset failed: '+t,'e');
+  }
+  // Restore button label for next open
+  btn.textContent='&#x1F9F9; Wipe Everything';
 }
 
 function openManualModal(){

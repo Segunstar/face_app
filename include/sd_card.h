@@ -56,6 +56,13 @@ namespace Bridge {
     String downloadAttendanceCSV(String date = "");
     bool   clearAttendanceLogs(String date = "");
 
+    // ── Factory reset ─────────────────────────────────────────────────────────
+    // Wipes all SD data to a clean slate: deletes every attendance log,
+    // FACE.BIN, users.txt (reset to []), and settings.json, then recreates
+    // the directory structure.  The caller must also clear the in-memory
+    // face id_list (done in api_factory_reset_handler in app_httpd.cpp).
+    bool   factoryReset();
+
     // ── Dashboard / storage / status ─────────────────────────────────────────
     String getStatsJSON();
     String getStorageJSON();
