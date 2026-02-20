@@ -63,7 +63,10 @@ AttendanceSettings  gSettings;
 
 // ─── Minimum free heap before attempting matrix allocation ────────────────────
 // face_detect() + aligned matrix need ~80 KB; guard at 100 KB to be safe.
-#define MIN_FREE_HEAP_BYTES  (100 * 1024)
+// Heap guard: skip face_detect when free heap falls below this threshold.
+// Raised to 130 KB (was 100 KB) so httpd DynamicJsonDocument allocations
+// (up to 16 KB each for /api/logs) always have room even under load.
+#define MIN_FREE_HEAP_BYTES  (130 * 1024)
 
 // ─── Forward declarations ────────────────────────────────────────────────────
 void startCameraServer();
@@ -249,6 +252,34 @@ void setup() {
         }, "ntp", 4096, NULL, 1, NULL);
     }
 
+    // 8) WiFi watchdog — checks connection every 30 s and reconnects if lost.
+    //    Without this, a hotspot idle-timeout or brief RF dropout makes the
+    //    portal permanently unreachable until a hardware reboot.
+    //    The task is self-contained and safe to run indefinitely.
+    xTaskCreate([](void*) {
+        const char *wSsid = ssid;
+        const char *wPass = password;
+        for (;;) {
+            vTaskDelay(pdMS_TO_TICKS(30000));
+            if (WiFi.status() != WL_CONNECTED) {
+                Serial.println("[WiFi] Connection lost – reconnecting…");
+                WiFi.disconnect(true);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                WiFi.begin(wSsid, wPass);
+                int tries = 0;
+                while (WiFi.status() != WL_CONNECTED && tries++ < 20) {
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                }
+                if (WiFi.status() == WL_CONNECTED) {
+                    Serial.printf("[WiFi] Reconnected – IP: %s\n",
+                                  WiFi.localIP().toString().c_str());
+                } else {
+                    Serial.println("[WiFi] Reconnect failed – will retry in 30 s");
+                }
+            }
+        }
+    }, "wifi_wdg", 3072, NULL, 1, NULL);
+
     Serial.printf("\n[READY] Admin portal:  http://%s  or  http://%s.local\n",
                   WiFi.localIP().toString().c_str(), MDNS_NAME);
     Serial.printf("[READY] Stream:        http://%s:81/stream\n",
@@ -412,7 +443,18 @@ static void attendanceTask(void *pvParameters) {
             dl_matrix3du_t *aligned = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
 
             if (aligned && align_face(boxes, im, aligned) == ESP_OK) {
-                dl_matrix3d_t *fid   = get_face_id(aligned);
+                dl_matrix3d_t *fid = get_face_id(aligned);
+                if (!fid) {
+                    // OOM inside get_face_id -- skip this frame, nothing to free
+                    if (aligned) dl_matrix3du_free(aligned);
+                    if (boxes->score)    dl_lib_free(boxes->score);
+                    if (boxes->box)      dl_lib_free(boxes->box);
+                    if (boxes->landmark) dl_lib_free(boxes->landmark);
+                    dl_lib_free(boxes);
+                    dl_matrix3du_free(im);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    continue;
+                }
                 face_id_node  *match = recognize_face_with_name(&id_list, fid);
 
                 if (match) {

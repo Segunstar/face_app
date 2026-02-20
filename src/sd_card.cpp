@@ -36,6 +36,22 @@
 static bool    _sdOk      = false;
 static time_t  _bootEpoch = 0;   // epoch at first NTP sync (for uptime calc)
 
+// ── In-memory user cache ──────────────────────────────────────────────────────
+// getUsersJSON() is called on every /api/stats (via getUserCount) AND every
+// /api/users request.  Reading users.txt from SD every 30 s while attendanceTask
+// is also writing causes systematic 2-second mutex timeouts that make the portal
+// return empty JSON on every endpoint -- the "portal blank after attendance mode"
+// bug.  Fix: cache the JSON string in RAM; invalidate ONLY on writes.
+// During attendance mode the user list never changes, so httpd gets a zero-cost
+// RAM hit with no SD contention at all.
+static String _usersCache   = "";
+static bool   _usersCacheOk = false;
+
+static inline void _invalidateUsersCache() {
+    _usersCacheOk = false;
+    _usersCache   = "";
+}
+
 // SdFat32 handles FAT32 (the format used by every ESP32-CAM microSD card)
 // and enables full LFN (long filename) support when built with
 // -D USE_LONG_FILE_NAMES=255.
@@ -417,14 +433,27 @@ void read_face_id_name_list_sdcard(face_id_name_list *l, const char *path) {
 //  User database  (JSON array at /db/users.txt)
 // ═══════════════════════════════════════════════════════════════════════════════
 String getUsersJSON() {
+    // Fast path: serve from in-memory cache.
+    // Cache is valid during the entire attendance session (user list unchanging).
+    // It is invalidated by saveUserToDB(), deleteUserFromDB(), and factoryReset().
+    if (_usersCacheOk && _usersCache.length() > 0) return _usersCache;
+
     if (!_sdOk) return "[]";
-    if (!SD_TAKE()) return "[]";
+    if (!SD_TAKE()) {
+        // Mutex timeout -- return stale cache if available, otherwise empty
+        Serial.println("[SD] getUsersJSON: mutex timeout, serving stale/empty");
+        return (_usersCache.length() > 0) ? _usersCache : "[]";
+    }
     File32 f;
     if (!f.open("/db/users.txt", O_RDONLY)) { SD_GIVE(); return "[]"; }
     String s = sdReadAll(f);
     f.close();
     SD_GIVE();
-    return (s.length() > 0) ? s : "[]";
+
+    // Populate cache
+    _usersCache   = (s.length() > 0) ? s : "[]";
+    _usersCacheOk = true;
+    return _usersCache;
 }
 
 int getUserCount() {
@@ -475,6 +504,7 @@ bool saveUserToDB(const UserRecord &user) {
     if (!f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) { SD_GIVE(); return false; }
     bool ok = serializeJson(doc, f) > 0;
     f.close();
+    if (ok) _invalidateUsersCache();  // force re-read on next getUsersJSON call
     SD_GIVE();
     Serial.printf("[DB] Saved user: %s  id: %s\n", user.name, user.id);
     return ok;
@@ -498,6 +528,7 @@ bool deleteUserFromDB(const char *name) {
             if (!f.open("/db/users.txt", O_WRONLY | O_CREAT | O_TRUNC)) { SD_GIVE(); return false; }
             bool ok = serializeJson(doc, f) > 0;
             f.close();
+            if (ok) _invalidateUsersCache();  // force re-read on next getUsersJSON call
             SD_GIVE();
             return ok;
         }
@@ -507,16 +538,19 @@ bool deleteUserFromDB(const char *name) {
 }
 
 // getUserByName – looks up a user in /db/users.txt by their display name.
+// Uses the in-memory user cache (populated by getUsersJSON) to avoid a per-
+// recognition SD read -- attendanceTask calls this on every face match, which
+// was a primary source of SD mutex contention during attendance mode.
 bool getUserByName(const char *name, UserRecord &out) {
     if (!_sdOk) return false;
-    if (!SD_TAKE()) return false;
-    File32 f;
-    if (!f.open("/db/users.txt", O_RDONLY)) { SD_GIVE(); return false; }
 
+    // Ensure cache is populated (getUsersJSON handles mutex and SD read)
+    String json = getUsersJSON();
+    if (json.length() < 3) return false;  // empty array "[]" = nothing to search
+
+    // Parse from cached string -- no SD access, no mutex required
     DynamicJsonDocument doc(8192);
-    DeserializationError err = deserializeJson(doc, f);
-    f.close();
-    if (err != DeserializationError::Ok) { SD_GIVE(); return false; }
+    if (deserializeJson(doc, json) != DeserializationError::Ok) return false;
 
     for (JsonObject u : doc.as<JsonArray>()) {
         if (strcmp(u["name"] | "", name) == 0) {
@@ -525,12 +559,10 @@ bool getUserByName(const char *name, UserRecord &out) {
             strncpy(out.name, u["name"] | name, sizeof(out.name) - 1);
             strncpy(out.dept, u["dept"] | "",   sizeof(out.dept) - 1);
             strncpy(out.role, u["role"] | "Student", sizeof(out.role) - 1);
-            SD_GIVE();
             return true;
         }
     }
-    SD_GIVE();
-    return false;  // not found – caller should fall back to name-only
+    return false;  // not found – caller falls back to name-only
 }
 
 // logAttendance – auto path.
@@ -554,6 +586,7 @@ void logAttendance(const AttendanceRecord &rec) {
                 String line = sdReadLine(chk);
                 if (line.indexOf(rec.uid) >= 0) {
                     chk.close();
+                    SD_GIVE();  // ← was missing: mutex was permanently locked here
                     Serial.printf("[ATD] %s already logged today\n", rec.name);
                     return;  // duplicate
                 }
@@ -899,6 +932,9 @@ bool factoryReset() {
 
     // Recreate the directory skeleton
     _sdBootstrapFS();
+
+    // Invalidate user cache -- DB is now an empty array
+    _invalidateUsersCache();
 
     Serial.println("[RESET] Factory reset complete -- clean slate");
     return true;
