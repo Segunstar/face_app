@@ -1148,15 +1148,44 @@ function mkBadge(val,type='status'){
   return`<span class="badge ${map[val]||''}">${ico[val]||''}${val}</span>`;
 }
 
+// ── Server date ────────────────────────────────────────────────────────────
+// The firmware writes attendance logs using its own date string (YYYY-MM-DD
+// when NTP is available, "no-ntp" when not).  The browser's local date can
+// differ, so we always fetch the server date and use it as the default filter
+// for the attendance tab so the two always stay in sync.
+let serverDate='';
+async function fetchServerDate(){
+  try{
+    const r=await fetch(H+'/api/server_date');
+    if(r.ok){
+      const d=(await r.text()).trim();
+      if(d.length>=5){
+        serverDate=d;
+        if(document.getElementById('att-date'))document.getElementById('att-date').value=d;
+        // Show a notice if NTP is not available so the admin knows
+        if(d==='no-ntp'){
+          const el=document.getElementById('att-date');
+          if(el)el.style.border='1px solid var(--amber)';
+          toast('NTP unavailable – attendance date may differ from calendar date','w');
+        }
+      }
+    }
+  }catch(e){}
+  // Fall back to browser date if fetch fails entirely
+  if(!serverDate){
+    serverDate=new Date().toISOString().slice(0,10);
+    if(document.getElementById('att-date'))document.getElementById('att-date').value=serverDate;
+  }
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────
-window.addEventListener('DOMContentLoaded',()=>{
+window.addEventListener('DOMContentLoaded',async()=>{
   const today=new Date().toISOString().slice(0,10);
-  if(document.getElementById('att-date'))document.getElementById('att-date').value=today;
   if(document.getElementById('man-date'))document.getElementById('man-date').value=today;
-  // Stagger initial loads: dashboard fires several sub-requests (/api/stats,
-  // /api/logs_range, /api/logs) that all hit the SD card simultaneously.
-  // Loading users 600 ms later lets the dashboard requests clear the SD mutex
-  // first, preventing the silent [] response that caused "users blank" on login.
+  // Fetch server date first — sets att-date to the firmware's current date key
+  // so the attendance tab filter always matches the log file being written to.
+  await fetchServerDate();
+  // Stagger initial loads so SD mutex isn't hammered all at once on login.
   loadDashboard();
   setTimeout(()=>loadUsers(), 600);
   // Auto-refresh

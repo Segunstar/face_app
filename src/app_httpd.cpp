@@ -155,23 +155,27 @@ static int run_face_recognition(dl_matrix3du_t *im, box_array_t *net_boxes,
                 matched = 1;
                 rgb_print(im, FACE_COLOR_GREEN, "Recognised");
 
-                // Look up the full user record from users.txt by name.
-                // match->id_name is just the display name stored in FACE.BIN.
-                // getUserByName fills in the proper uid and dept.
-                UserRecord user;
-                bool found = Bridge::getUserByName(node->id_name, user);
+                // Only log attendance when NOT in an admin portal session.
+                // When `authenticated` is true, the stream is being used for
+                // enrollment camera preview — logging attendance here would
+                // burn the user's daily slot while the admin is still active
+                // in the portal, causing every subsequent real recognition by
+                // attendanceTask to hit "already logged today".
+                if (!authenticated) {
+                    UserRecord user;
+                    bool found = Bridge::getUserByName(node->id_name, user);
 
-                AttendanceRecord rec = {};
-                if (found) {
-                    strncpy(rec.uid,  user.id,   sizeof(rec.uid)  - 1);
-                    strncpy(rec.name, user.name, sizeof(rec.name) - 1);
-                    strncpy(rec.dept, user.dept, sizeof(rec.dept) - 1);
-                } else {
-                    // User not in DB (enrolled but not registered) – use name as fallback
-                    strncpy(rec.uid,  node->id_name, sizeof(rec.uid)  - 1);
-                    strncpy(rec.name, node->id_name, sizeof(rec.name) - 1);
+                    AttendanceRecord rec = {};
+                    if (found) {
+                        strncpy(rec.uid,  user.id,   sizeof(rec.uid)  - 1);
+                        strncpy(rec.name, user.name, sizeof(rec.name) - 1);
+                        strncpy(rec.dept, user.dept, sizeof(rec.dept) - 1);
+                    } else {
+                        strncpy(rec.uid,  node->id_name, sizeof(rec.uid)  - 1);
+                        strncpy(rec.name, node->id_name, sizeof(rec.name) - 1);
+                    }
+                    Bridge::logAttendance(rec);
                 }
-                Bridge::logAttendance(rec);
             } else {
                 rgb_print(im, FACE_COLOR_RED, "Unknown");
                 matched = -1;
@@ -365,6 +369,19 @@ static esp_err_t api_sync_ntp_handler(httpd_req_t *req) {
     Bridge::syncNTP();
     set_cors_headers(req);
     return httpd_resp_send(req, "NTP synced OK", HTTPD_RESP_USE_STRLEN);
+}
+
+// GET /api/server_date
+// Returns the date string the firmware is using for today's log file.
+// The browser portal uses this as the default date filter for the attendance
+// tab so it always matches – even when NTP is unavailable and the server date
+// is something other than the browser's local calendar date.
+static esp_err_t api_server_date_handler(httpd_req_t *req) {
+    String d = Bridge::getServerDate();
+    set_cors_headers(req);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, d.c_str(), (ssize_t)d.length());
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -702,7 +719,7 @@ void startCameraServer() {
     esp_log_level_set("httpd_uri",  ESP_LOG_ERROR);
 
     httpd_config_t cfg  = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers  = 26;  // bumped from 25 to accommodate /api/factory_reset
+    cfg.max_uri_handlers  = 27;  // bumped for /api/factory_reset and /api/server_date
     cfg.stack_size        = 8192;
     // Shorter socket timeouts: prevent a stalled client from holding a httpd
     // worker thread for the full default 60-second period, which blocks other
@@ -737,6 +754,8 @@ void startCameraServer() {
         {"/api/settings",         HTTP_POST, api_settings_post_handler,  NULL},
         // Factory reset
         {"/api/factory_reset",    HTTP_POST, api_factory_reset_handler,  NULL},
+        // Server date (used by portal to sync attendance tab filter with firmware date)
+        {"/api/server_date",      HTTP_GET,  api_server_date_handler,    NULL},
     };
 
     if (httpd_start(&camera_httpd, &cfg) == ESP_OK) {

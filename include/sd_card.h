@@ -75,6 +75,7 @@ namespace Bridge {
     // ── NTP ──────────────────────────────────────────────────────────────────
     void   syncNTP();
     String getCurrentDateStr();
+    String getServerDate();       // same as getCurrentDateStr() – exposed for /api/server_date
     String getCurrentTimeStr();
     String getCurrentHHMM();
 
